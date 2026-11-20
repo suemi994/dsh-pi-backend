@@ -1,0 +1,11 @@
+{
+  "name": "@suemi/dsh-backend-pi-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "ISC",
+  "main": "register.js",
+  "engines": { "node": ">=22.19" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "scripts": { "test": "node --test test/*.test.js" }
+}

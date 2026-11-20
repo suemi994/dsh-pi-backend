@@ -1,0 +1,30 @@
+{
+  "$schema": "urn:dsh-std:community-draft:dsh-plugin:0.15",
+  "manifestVersion": "0.15",
+  "id": "com.suemi.pi-cli-backend",
+  "name": "Pi CLI Backend for dsh-tui",
+  "version": "0.1.0",
+  "facets": { "host": { "entry": "register.js", "apiVersion": "v1alpha1" } },
+  "requires": { "contracts": [] },
+  "permissions": [],
+  "contributes": {
+    "commands": [],
+    "x-dsh-tui": [{
+      "apiVersion": "tui.dsh/v1alpha1",
+      "kind": "Backend",
+      "id": "com.suemi.pi-cli-backend",
+      "name": "pi_cli_backend",
+      "spec": {
+        "id": "pi-cli",
+        "label": { "text": "Pi (CLI)" },
+        "shortLabel": "Pi CLI",
+        "product": "pi",
+        "capabilities": ["models", "effort", "compact"],
+        "grants": [],
+        "confirmation": { "policy": "confirm" }
+      }
+    }]
+  },
+  "subscriptions": [],
+  "license": "ISC"
+}
