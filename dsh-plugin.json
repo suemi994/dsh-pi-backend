@@ -19,7 +19,7 @@
         "label": { "text": "Pi (CLI)" },
         "shortLabel": "Pi CLI",
         "product": "pi",
-        "capabilities": ["models", "effort", "compact"],
+        "capabilities": ["permissions", "questions", "models", "effort", "compact", "sideQuery", "commands", "context", "images", "rename", "fork", "rewind"],
         "grants": [],
         "confirmation": { "policy": "confirm" }
       }

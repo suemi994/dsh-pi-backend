@@ -7,9 +7,7 @@ export const piCliManifest = {
     shortLabel: 'Pi CLI',
     inTree: false,
     backendExport: 'backend',
-    // The session serves `/model` off the `pi` CLI's own catalog; declaring it is
-    // how dst admits the capability name and offers the command.
-    capabilities: ['models', 'effort', 'compact'],
+    capabilities: ['permissions', 'questions', 'models', 'effort', 'compact', 'sideQuery', 'commands', 'context', 'images', 'rename', 'fork', 'rewind'],
     grants: [],
 };
 export const piCliBackend = {

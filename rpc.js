@@ -1,5 +1,16 @@
 import { spawn } from 'node:child_process';
 
+export function formatPiRpcExit(code, signal, stderr) {
+    const status = signal ?? code ?? 'unknown';
+    const lines = String(stderr ?? '')
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(Boolean);
+    const errorAt = lines.findIndex(line => /^[A-Za-z]*Error:/.test(line));
+    const detail = lines.slice(errorAt < 0 ? 0 : errorAt).join(' | ').replace(/\s+/g, ' ');
+    return `Pi RPC exited (${status})${detail ? `: ${detail.slice(0, 2000)}` : ''}`;
+}
+
 export class PiRpc {
     #pending = new Map();
     #nextId = 0;
@@ -7,8 +18,8 @@ export class PiRpc {
     #failure;
     #closing = false;
 
-    constructor(args, cwd, onEvent, onExit) {
-        const child = spawn('pi', args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+    constructor(args, cwd, onEvent, onExit, { spawnProcess = spawn } = {}) {
+        const child = spawnProcess('pi', args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
         this.child = child;
         let buffer = '';
         let stderr = '';
@@ -33,11 +44,12 @@ export class PiRpc {
         child.stdin.on('error', () => {}); // A pending write or child close reports stream failure.
         child.once('error', error => { spawnError = error; });
         this.#closed = new Promise(resolve => child.once('close', (code, signal) => {
-            const detail = stderr.trim();
-            this.#failure = spawnError ?? new Error(`Pi RPC exited (${signal ?? code})${detail ? `: ${detail}` : ''}`);
+            this.#failure = spawnError ?? new Error(formatPiRpcExit(code, signal, stderr));
+            this.#failure.exitCode = code;
+            this.#failure.signal = signal;
             for (const request of this.#pending.values()) request.reject(this.#failure);
-            onExit(this.#failure, this.#closing);
-            resolve();
+            try { onExit(this.#failure, this.#closing); }
+            finally { resolve(); }
         }));
     }
 

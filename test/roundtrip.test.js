@@ -24,7 +24,7 @@ function text(content) {
     return content?.filter(block => block.type === 'text').map(block => block.text).join('');
 }
 
-function mockProvider(requests, summaries) {
+function mockProvider(requests, summaries, sideRequests, extra) {
     return createServer(async (req, res) => {
         try {
             assert.equal(req.method, 'POST');
@@ -37,7 +37,18 @@ function mockProvider(requests, summaries) {
             const messages = input.messages
                 .filter(({ role }) => role === 'user' || role === 'assistant')
                 .map(({ role, content }) => [role, text(content)]);
-            const reply = turns.find(([prompt]) => prompt === messages.at(-1)?.[1])?.[1];
+            const prompt = messages.at(-1)?.[1];
+            const side = prompt?.startsWith('Conversation excerpts (JSON):');
+            if (side) {
+                assert.equal(input.tools?.length ?? 0, 0);
+                sideRequests.push(prompt);
+            }
+            const extraReply = await extra?.(prompt, input);
+            const reply = extraReply ?? (side
+                ? prompt.includes('Create a compact session recap')
+                    ? JSON.stringify({ title: 'Pi round-trip recap', summary: 'Side recap from Pi' })
+                    : prompt.includes('Which branch is active?') ? 'Side branch answer from Pi' : 'Side answer from Pi'
+                : turns.find(([text]) => text === prompt)?.[1]);
             if (!reply) {
                 // Pi's compaction asks for a summary instead of a normal prompt.
                 summaries.push(messages);
@@ -49,15 +60,15 @@ function mockProvider(requests, summaries) {
                 res.end('data: [DONE]\n\n');
                 return;
             }
-            requests.push({ messages, effort: input.reasoning_effort });
+            if (!side) requests.push({ messages, effort: input.reasoning_effort });
 
             res.writeHead(200, { 'content-type': 'text/event-stream' });
-            const send = choice => res.write(`data: ${JSON.stringify({
+            const send = (choice, usage) => res.write(`data: ${JSON.stringify({
                 id: 'chatcmpl-roundtrip', object: 'chat.completion.chunk', created: 1, model,
-                choices: [{ index: 0, ...choice }],
+                choices: [{ index: 0, ...choice }], usage,
             })}\n\n`);
             send({ delta: { role: 'assistant', content: reply }, finish_reason: null });
-            send({ delta: {}, finish_reason: 'stop' });
+            send({ delta: {}, finish_reason: 'stop' }, { prompt_tokens: 42, completion_tokens: 7, total_tokens: 49, prompt_tokens_details: { cached_tokens: 12 } });
             res.end('data: [DONE]\n\n');
         } catch (error) {
             res.writeHead(400, { 'content-type': 'application/json' });
@@ -87,6 +98,7 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
     const agentDir = join(temp, 'agent');
     const cwd = join(temp, 'project');
     const dataDir = join(temp, 'backend-data');
+    const isolatedHome = join(temp, 'home');
     const env = {
         PI_CODING_AGENT_DIR: agentDir,
         PI_CODING_AGENT_SESSION_DIR: undefined,
@@ -110,7 +122,12 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
         await rm(temp, { recursive: true, force: true });
     });
     setEnv(env);
-    await Promise.all([mkdir(agentDir), mkdir(cwd), mkdir(dataDir)]);
+    await Promise.all([
+        mkdir(agentDir),
+        mkdir(cwd),
+        mkdir(dataDir),
+        mkdir(join(isolatedHome, '.dsh-tui'), { recursive: true }),
+    ]);
 
     const runPi = (...args) => {
         const pending = execFile('pi', args, { cwd, timeout: 12_000, signal: t.signal });
@@ -127,9 +144,30 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
 
     const requests = [];
     const summaries = [];
-    const server = mockProvider(requests, summaries);
+    const sideRequests = [];
+    const forkPaths = [];
+    let releaseImageTurn;
+    let sawImageTurn;
+    const imageTurn = new Promise(resolve => { sawImageTurn = resolve; });
+    const imageTurnRelease = new Promise(resolve => { releaseImageTurn = resolve; });
+    const imageInputs = [];
+    const server = mockProvider(requests, summaries, sideRequests, async (prompt, input) => {
+        if (!['Fixture image prompt', 'Fixture steer', 'Fixture follow-up'].includes(prompt)) return;
+        imageInputs.push(input.messages.at(-1).content);
+        if (prompt === 'Fixture image prompt') {
+            sawImageTurn();
+            await imageTurnRelease;
+        }
+        return 'Fixture reply';
+    });
     server.listen(0, '127.0.0.1');
-    await once(server, 'listening');
+    try {
+        await once(server, 'listening');
+    } catch (error) {
+        if (!['EPERM', 'EACCES'].includes(error.code)) throw error;
+        t.skip(`loopback listeners are unavailable: ${error.code}`);
+        return;
+    }
     t.after(() => {
         server.closeAllConnections();
         return new Promise((done, fail) => server.close(error => error ? fail(error) : done()));
@@ -139,7 +177,7 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
             [provider]: {
                 baseUrl: `http://127.0.0.1:${server.address().port}/v1`,
                 api: 'openai-completions', apiKey: 'local-fixture',
-                models: [{ id: model, name: 'Round-trip model', reasoning: true, input: ['text'],
+                models: [{ id: model, name: 'Round-trip model', reasoning: true, input: ['text', 'image'],
                     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 1024 }],
             },
         },
@@ -148,6 +186,42 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
     await writeFile(join(agentDir, 'settings.json'), JSON.stringify({
         defaultProvider: provider, defaultModel: model, compaction: { keepRecentTokens: 0, reserveTokens: 100 },
     }));
+
+    await mkdir(join(agentDir, 'extensions'));
+    await writeFile(join(agentDir, 'extensions', 'test-status.js'), `
+        export default function (pi) {
+            pi.on('session_start', (_event, ctx) => {
+                ctx.ui.setStatus('fixture', 'Pi fixture extension ready');
+                ctx.ui.setWidget('fixture-list', ['Pi widget fixture line']);
+            });
+            pi.registerCommand('plan', {
+                description: 'Fixture Plan extension command',
+                handler: async (args, ctx) => {
+                    if (args.trim() === 'dialog') {
+                        const choice = await ctx.ui.select('Fixture plan action', ['Start', 'Review']);
+                        const note = await ctx.ui.input('Fixture plan note', 'Enter a note');
+                        const approved = await ctx.ui.confirm('Fixture plan approval', 'Apply the fixture plan?');
+                        const edited = await ctx.ui.editor('Fixture plan editor', 'draft plan');
+                        ctx.ui.notify('PLAN_DIALOG_RESULT:' + choice + '|' + note + '|' + approved + '|' + edited, 'info');
+                        return;
+                    }
+                    ctx.ui.notify('PLAN_COMMAND:' + args.trim(), 'info');
+                },
+            });
+            pi.registerCommand('goal', {
+                description: 'Fixture Goal extension command',
+                handler: async (args, ctx) => {
+                    ctx.ui.notify('GOAL_COMMAND:' + args.trim(), 'info');
+                },
+            });
+            pi.registerCommand('prefill', {
+                description: 'Fixture editor prefill command',
+                handler: async (args, ctx) => {
+                    ctx.ui.setEditorText('PREFILL:' + args.trim());
+                },
+            });
+        }
+    `);
 
     const cliArgs = ['--print', '--no-extensions', '--no-skills', '--no-context-files', '--model', `${provider}/${model}`];
     const seed = await runPi(...cliArgs, '--', turns[0][0]);
@@ -174,36 +248,76 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
         const socket = `pi-roundtrip-${process.pid}`;
         const tmux = (...args) => execFile('tmux', ['-L', socket, ...args], { timeout: 5000 });
         t.after(() => tmux('kill-server').catch(() => {}));
-        const waitForPane = async (expected) => {
+        const waitForPane = async (expected, present = true) => {
             const deadline = Date.now() + 12_000;
             let screen = '';
             while (Date.now() < deadline) {
                 screen = (await tmux('capture-pane', '-p', '-S', '-100')).stdout;
-                if (screen.includes(expected)) return;
+                if (screen.includes(expected) === present) return;
                 await new Promise(resolve => setTimeout(resolve, 100));
             }
             assert.fail(`TUI did not display ${expected}:\n${screen}`);
         };
         await tmux('new-session', '-d', '-x', '120', '-y', '40', '-c', cwd, 'env',
-            `DSH_HOME=${profile}`, ...Object.entries(env).filter(([, value]) => value !== undefined).map(([key, value]) => `${key}=${value}`),
+            `HOME=${isolatedHome}`,
+            `DSH_HOME=${profile}`, 'DSH_TUI_LANG=en', ...Object.entries(env).filter(([, value]) => value !== undefined).map(([key, value]) => `${key}=${value}`),
             'dsh-tui', '--backend', 'pi-cli');
         await waitForPane('Pi CLI · pi v');
         await tmux('send-keys', '-l', '/resume');
-        await waitForPane('│ ⌘ /resume');
+        await waitForPane('/resume');
         await tmux('send-keys', 'Enter');
         await waitForPane(turns[0][0]);
         await tmux('send-keys', 'Enter');
         await waitForPane(turns[0][1]);
+        await tmux('send-keys', '-l', '/panel');
+        await tmux('send-keys', 'Enter');
+        await waitForPane('Open panel');
+        for (let index = 0; index < 8; index += 1) await tmux('send-keys', 'Down');
+        await waitForPane('Pi Extensions');
+        await tmux('send-keys', 'Enter');
+        await waitForPane('Pi fixture extension ready');
+        await waitForPane('Pi widget fixture line');
+        await tmux('send-keys', 'C-b');
+        await waitForPane('Pi widget fixture line', false);
         for (const [index, [prompt, reply]] of turns.slice(1, 3).entries()) {
             const command = `/effort ${['high', 'low'][index]}`;
             await tmux('send-keys', '-l', command);
             await waitForPane(command);
             await tmux('send-keys', 'Enter');
-            await waitForPane(`roundtrip/roundtrip-model · ${['high', 'low'][index]}`);
+            await waitForPane(`roundtrip-model · ${['high', 'low'][index]}`);
             await tmux('send-keys', '-l', prompt);
             await tmux('send-keys', 'Enter');
             await waitForPane(reply);
         }
+        await tmux('send-keys', '-l', '/panel info');
+        await tmux('send-keys', 'Enter');
+        await waitForPane('Cache hit');
+        await waitForPane('90→21');
+        await waitForPane('Pi native');
+        await tmux('send-keys', 'C-b');
+        await waitForPane('Esc chat', false);
+        await tmux('send-keys', '-l', '/pi-');
+        await waitForPane('pi-suggest');
+        await tmux('send-keys', 'C-u');
+        await tmux('send-keys', '-l', '/pi-tree');
+        await tmux('send-keys', 'Enter');
+        await waitForPane('Pi session tree');
+        await tmux('send-keys', '-l', '/recap');
+        await tmux('send-keys', 'Enter');
+        await waitForPane('Side recap from Pi');
+        await waitForPane('Pi round-trip recap');
+        await tmux('send-keys', 'Escape');
+        await waitForPane('Side recap from Pi', false);
+        await tmux('send-keys', '-l', '/btw Which branch is active?');
+        await waitForPane('Which branch is active?');
+        await tmux('send-keys', 'Enter');
+        await waitForPane('Side branch answer from Pi');
+        await tmux('send-keys', 'C-b');
+        await waitForPane('Side branch answer from Pi', false);
+        await tmux('send-keys', '-l', '/prefill from Pi');
+        await tmux('send-keys', 'Enter');
+        await waitForPane('PREFILL:from Pi');
+        await tmux('send-keys', 'C-u');
         await tmux('send-keys', '-l', '/compact');
         await waitForPane('/compact');
         await tmux('send-keys', 'Enter');
@@ -221,6 +335,8 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
             assert.equal(session.sessionId, header.id);
             const replayed = await session.history();
             assert.deepEqual(replayed.filter(event => event.type === 'user.message').map(event => event.text), [turns[0][0]]);
+            assert.ok(replayed.some(event => event.type === 'usage' && event.usage.output === 7));
+            assert.ok(replayed.some(event => event.type === 'session.ready' && event.contextWindow === 8192));
             const live = [];
             const unsubscribe = session.subscribe(batch => live.push(...batch));
             try {
@@ -236,14 +352,104 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
                     assert.ok(live.some(event => event.type === 'effort.changed' && event.effort === level));
                     const result = await session.submit({ text: prompt, clientMessageId: `roundtrip-backend-${index}` }, 'turn');
                     assert.equal(result.accepted, true);
+                    await session.activeTurn?.done;
                     const end = live.find(event => event.type === 'turn.end');
                     assert.equal(end?.reason?.kind, 'completed', JSON.stringify(end));
                     assert.equal(live.filter(event => event.type === 'assistant.delta' && event.delta.kind === 'text')
                         .map(event => event.delta.text).join(''), reply);
+                    assert.ok(live.some(event => event.type === 'usage' && event.usage.output === 7));
+                    assert.ok(live.some(event => event.type === 'context.usage' && event.max === 8192));
                     assert.equal(session.rpc.child, child);
                     assert.equal(child.exitCode, null);
                     assert.equal(child.signalCode, null);
                 }
+                const commands = await session.capabilities.commands.list();
+                assert.ok(commands.some(command => command.name === 'pi-tree'));
+                assert.ok(commands.some(command => command.name === 'plan'));
+                assert.ok(commands.some(command => command.name === 'goal'));
+                const currentUser = live.find(event => event.type === 'user.message' && event.source === 'user');
+                const waitForLive = async predicate => {
+                    const deadline = Date.now() + 5000;
+                    while (Date.now() < deadline) {
+                        const found = live.find(predicate);
+                        if (found) return found;
+                        await new Promise(resolve => setTimeout(resolve, 10));
+                    }
+                    assert.fail(`Timed out waiting for live event: ${JSON.stringify(live.slice(-8))}`);
+                };
+                live.length = 0;
+                const planCommand = session.submit({ text: '/plan dialog', clientMessageId: 'plan-dialog' }, 'turn');
+                const planChoice = await waitForLive(event => event.type === 'question.request');
+                assert.equal(planChoice.request.questions[0].question, 'Fixture plan action');
+                session.capabilities.questions.respond(planChoice.request.requestId, {
+                    answers: [{ selected: ['Review'] }],
+                });
+                const planNote = await waitForLive(event => event.type === 'question.request'
+                    && event.request.requestId !== planChoice.request.requestId);
+                assert.equal(planNote.request.questions[0].detail, 'Enter a note');
+                session.capabilities.questions.respond(planNote.request.requestId, {
+                    answers: [{ selected: [], custom: 'Keep the extension flow' }],
+                });
+                const planApproval = await waitForLive(event => event.type === 'permission.request');
+                assert.equal(planApproval.request.title, 'Fixture plan approval');
+                session.capabilities.permissions.respond(planApproval.request.requestId, { kind: 'allow-once' });
+                const planEditor = await waitForLive(event => event.type === 'question.request'
+                    && event.request.requestId !== planChoice.request.requestId
+                    && event.request.requestId !== planNote.request.requestId);
+                assert.match(planEditor.request.questions[0].detail, /draft plan/);
+                session.capabilities.questions.respond(planEditor.request.requestId, {
+                    answers: [{ selected: [], custom: 'edited fixture plan' }],
+                });
+                assert.equal((await planCommand).accepted, true);
+                const planResult = await waitForLive(event => event.type === 'notice'
+                    && event.text.startsWith('PLAN_DIALOG_RESULT:'));
+                assert.equal(planResult.text, 'PLAN_DIALOG_RESULT:Review|Keep the extension flow|true|edited fixture plan');
+
+                live.length = 0;
+                assert.equal((await session.submit({ text: '/goal fixture objective', clientMessageId: 'goal-command' }, 'turn')).accepted, true);
+                const goalResult = await waitForLive(event => event.type === 'notice'
+                    && event.text.startsWith('GOAL_COMMAND:'));
+                assert.equal(goalResult.text, 'GOAL_COMMAND:fixture objective');
+                const beforeSide = await readFile(file, 'utf8');
+                const deltas = [];
+                assert.deepEqual(await session.capabilities.sideQuery.ask('What have we done?', { onText: delta => deltas.push(delta) }),
+                    { answer: 'Side answer from Pi' });
+                assert.equal(deltas.join(''), 'Side answer from Pi');
+                assert.match(sideRequests.at(-1), /second backend reply from Pi/);
+                const cancelled = AbortSignal.abort();
+                assert.deepEqual(await session.capabilities.sideQuery.ask('Cancelled', { signal: cancelled }), { answer: null });
+                await session.submit({ text: '/pi-suggest', clientMessageId: 'suggestion' }, 'turn');
+                assert.ok(live.some(event => event.source === 'command-output' && event.label === '/pi-suggest' && event.text === 'Side answer from Pi'));
+                await session.submit({ text: '/pi-tree', clientMessageId: 'tree' }, 'turn');
+                assert.ok(live.some(event => event.source === 'command-output' && event.label === '/pi-tree' && event.text.includes(turns[0][0])));
+                assert.equal(await readFile(file, 'utf8'), beforeSide);
+                assert.ok((await session.capabilities.context.usage('full')).used > 0);
+
+                const forked = await session.capabilities.fork.fork(undefined, 'Forked title');
+                const rewind = await session.capabilities.rewind.rewind(currentUser.anchor, 'conversation');
+                assert.equal(rewind.kind, 'rewound', JSON.stringify(rewind));
+                const firstAnchor = replayed.find(event => event.source === 'user').anchor;
+                const rewindToFirst = await session.capabilities.rewind.rewind(firstAnchor, 'conversation');
+                assert.equal(rewindToFirst.kind, 'rewound', JSON.stringify(rewindToFirst));
+                await session.submit({ text: `/pi-fork ${firstAnchor}`, clientMessageId: 'tree-fork' }, 'turn');
+                const forkCommand = live.find(event => event.source === 'command-output' && event.label === '/pi-fork');
+                const forkFromTree = { sessionId: forkCommand?.text.match(/\/resume ([a-f0-9-]+)/)?.[1] };
+                assert.ok(forkFromTree.sessionId);
+                for (const [ref, count] of [[forked, 6], [rewind.session, 4], [rewindToFirst.session, 0], [forkFromTree, 1]]) {
+                    const path = (await nativeSessionFiles(agentDir)).find(path => path.endsWith(`${ref.sessionId}.jsonl`));
+                    assert.ok(path);
+                    forkPaths.push(path);
+                    const contents = await readFile(path, 'utf8');
+                    assert.equal(entries(contents)[0].parentSession, file);
+                    assert.deepEqual(messages(contents), transcript.slice(0, count));
+                    const reopenedFork = await backend.open({ kind: 'resume', sessionId: ref.sessionId, cwd }, host);
+                    await reopenedFork.dispose();
+                }
+                assert.equal((await backend.catalog.info(forked.sessionId, cwd)).title.text, 'Forked title');
+                await session.capabilities.rename.rename('Renamed Pi session');
+                assert.ok(live.some(event => event.type === 'session.title' && event.title === 'Renamed Pi session'));
+                assert.equal((await backend.catalog.info(header.id, cwd)).title.text, 'Renamed Pi session');
+                assert.equal(session.rpc.child, child);
                 const compaction = [];
                 session.subscribe(batch => compaction.push(...batch));
                 await session.capabilities.compact.run();
@@ -281,11 +487,93 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
     const completed = await readFile(file, 'utf8');
     assert.ok(completed.startsWith(appended), 'Pi must preserve the backend’s appended entries');
     assert.deepEqual(messages(completed), transcript);
-    assert.deepEqual(await nativeSessionFiles(agentDir), [file]);
+    assert.deepEqual((await nativeSessionFiles(agentDir)).sort(), [file, ...forkPaths].sort());
     assert.deepEqual(requests.slice(0, 3).map(request => request.messages), turns.slice(0, 3).map((_, index) => transcript.slice(0, index * 2 + 1)));
     assert.ok(summaries.length >= 1, 'Pi asked its model for a compaction summary');
     assert.deepEqual(requests.slice(1).map(request => request.effort), ['high', 'low', 'low']);
     assert.deepEqual(entries(appended).filter(entry => entry.type === 'thinking_level_change').slice(-2)
         .map(entry => entry.thinkingLevel), ['high', 'low']);
     assert.equal(entries(appended).filter(entry => entry.type === 'compaction').length, 1);
+
+    if (!profile) {
+        const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
+        const image = { id: 'fixture-image', mediaType: 'image/png', width: 1, height: 1, read: async () => png };
+        const fresh = await backend.open({ kind: 'new', cwd }, host);
+        const live = [];
+        fresh.subscribe(batch => live.push(...batch));
+        try {
+            assert.equal((await fresh.submit({ text: 'Fixture image prompt', clientMessageId: 'image',
+                blocks: [{ type: 'text', text: 'Fixture image prompt' }, { type: 'image' }], images: [image] }, 'turn')).accepted, true);
+            await imageTurn;
+            const done = fresh.activeTurn.done;
+            assert.equal((await fresh.submit({ text: '/steer Fixture steer', clientMessageId: 'steer', images: [image] }, 'steer')).accepted, true);
+            assert.equal((await fresh.submit({ text: 'Fixture follow-up', clientMessageId: 'follow' }, 'followup')).accepted, true);
+            assert.ok(live.some(event => event.type === 'pending.changed' && event.items.some(item => item.id === 'steer')));
+            releaseImageTurn();
+            await done;
+            assert.equal(imageInputs.length, 3);
+            assert.ok(imageInputs[0].some(block => block.image_url?.url?.startsWith('data:image/png;base64,')));
+            assert.ok(imageInputs[1].some(block => block.image_url?.url?.startsWith('data:image/png;base64,')));
+            assert.ok(live.some(event => event.type === 'pending.changed' && event.claimed?.includes('steer')));
+            assert.ok(live.some(event => event.type === 'user.message' && event.source === 'injected' && event.text === 'Fixture steer'));
+        } finally {
+            releaseImageTurn();
+            await fresh.dispose();
+        }
+        const resumed = await backend.open({ kind: 'resume', sessionId: fresh.sessionId, cwd }, host);
+        try {
+            const imageRows = (await resumed.history()).filter(event => event.type === 'user.message' && event.images?.length);
+            assert.equal(imageRows.length, 2);
+            assert.equal(imageRows[1].images[0].width, 1);
+            assert.deepEqual(await imageRows[1].images[0].read(), png);
+        } finally { await resumed.dispose(); }
+    }
+});
+
+test('Pi tools project live output and structured cards', async () => {
+    const { PiCliSession } = await import('../session.js');
+    const session = new PiCliSession({ kind: 'new', cwd: '/tmp' }, {});
+    session.activeTurn = { assistants: [] };
+    const live = [];
+    session.subscribe(batch => live.push(...batch));
+    session.onRecord({ type: 'tool_execution_start', toolCallId: 'test', toolName: 'bash', args: { command: 'pwd' } });
+    for (const text of ['first\n', 'first\nsecond\n']) {
+        session.onRecord({ type: 'tool_execution_update', toolCallId: 'test', partialResult: { content: [{ type: 'text', text }] } });
+    }
+    session.onRecord({ type: 'tool_execution_end', toolCallId: 'test', result: { content: [{ type: 'text', text: 'first\nsecond\n' }] } });
+    const [call, first, second, result] = live;
+    assert.equal(call.presentation.card, 'terminal');
+    assert.equal(first.text, 'first\n');
+    assert.equal(second.text, 'second\n');
+    assert.equal(result.presentation.output, 'first\nsecond\n');
+    assert.equal(call.step, result.step);
+    assert.deepEqual((await session.history()).map(event => event.type), ['tool.call', 'tool.result']);
+});
+
+test('Pi extension todos and subagents project live and on replay', async () => {
+    const { PiCliSession } = await import('../session.js');
+    const session = new PiCliSession({ kind: 'new', cwd: '/tmp' }, {});
+    session.activeTurn = { assistants: [] };
+    session.onRecord({ type: 'tool_execution_start', toolCallId: 'todo-1', toolName: 'todo' });
+    const todos = { todos: [{ text: 'First task', done: false }, { text: 'Done task', done: true }] };
+    session.onRecord({ type: 'tool_execution_end', toolCallId: 'todo-1', toolName: 'todo', result: { details: todos } });
+    session.onRecord({ type: 'tool_execution_start', toolCallId: 'delegate', toolName: 'subagent' });
+    const agent = { agent: 'reviewer', task: 'Review the changes', status: 'running' };
+    session.onRecord({ type: 'tool_execution_update', toolCallId: 'delegate', toolName: 'subagent',
+        partialResult: { details: { results: [agent] } } });
+    const result = { details: { results: [{ ...agent, status: 'completed' }] } };
+    session.onRecord({ type: 'tool_execution_end', toolCallId: 'delegate', toolName: 'subagent', result });
+    const replay = new PiCliSession({ kind: 'new', cwd: '/tmp' }, {});
+    replay.replayEntry({ type: 'message', message: { role: 'toolResult', toolName: 'todo', toolCallId: 'todo-1', details: todos } });
+    replay.replayEntry({ type: 'message', message: { role: 'toolResult', toolName: 'subagent', toolCallId: 'delegate', ...result } });
+    for (const instance of [session, replay]) {
+        const events = await instance.history();
+        assert.deepEqual(events.find(event => event.type === 'todo.write').items, [
+            { content: 'First task', status: 'pending' }, { content: 'Done task', status: 'completed' },
+        ]);
+        const children = events.filter(event => event.type.startsWith('subagent.'));
+        assert.deepEqual(children.map(event => event.type), ['subagent.start', 'subagent.end']);
+        assert.equal(children[0].agentId, children[1].agentId);
+        assert.equal(children[1].status, 'completed');
+    }
 });

@@ -1,10 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
-import { readPiBranch, messageText, requirePiSessionFile } from './catalog.js';
+import { readPiBranch, messageText, piBranch, requirePiSessionFile, writePiFork } from './catalog.js';
 import { dirname, join } from 'node:path';
 import { modelSpec } from './catalog-models.js';
 import { PiRpc } from './rpc.js';
+import { askPiSideQuery } from './side-query.js';
+import { createPiExtensionState, piTodos, piSubagents } from './extension-state.js';
+import { piImageInputs, piImageLimits, piTranscriptImages } from './images.js';
+import { PiInteractions } from './interactions.js';
+import { piToolCall, piToolResult } from './presentation.js';
+import { createPiPromptInjector } from './prompt-injection.js';
 function ev(e) {
     return e;
 }
@@ -12,10 +18,38 @@ export class PiCliSession {
     backendId = 'pi-cli';
     sessionId;
     ref;
-    /** `models` is what makes dst offer `/model`; without it the command is
-     *  refused as backend-unavailable and no picker opens. */
     capabilities = {
         native: {},
+        permissions: {
+            respond: (requestId, decision) => this.interactions.respondPermission(requestId, decision),
+            pending: () => this.interactions.pendingPermissions(),
+        },
+        questions: {
+            respond: (requestId, answers) => this.interactions.respondQuestion(requestId, answers),
+            cancel: requestId => this.interactions.cancelQuestion(requestId),
+        },
+        images: { limits: piImageLimits },
+        sideQuery: { ask: (prompt, options) => askPiSideQuery(this, prompt, options) },
+        commands: { list: () => this.listCommands() },
+        context: { usage: async () => {
+            const { contextUsage } = await this.rpc.request('get_session_stats');
+            if (contextUsage?.tokens == null) throw new Error('Pi has no current context measurement');
+            return { used: contextUsage.tokens, max: contextUsage.contextWindow, categories: [] };
+        } },
+        rename: { rename: async title => {
+            await this.rpc.request('set_session_name', { name: title });
+            this.title = title;
+            this.emitLive([ev({ type: 'session.title', title, source: 'user' })], { replay: false });
+        } },
+        fork: { fork: (anchor, title) => this.forkSession(anchor, title) },
+        rewind: { rewind: async (anchor, mode) => {
+            if (mode !== 'conversation') return { kind: 'refused', reason: 'Pi supports conversation rewind only' };
+            try {
+                return { kind: 'rewound', session: await this.forkSession(anchor, undefined, true) };
+            } catch (error) {
+                return { kind: 'refused', reason: error.message };
+            }
+        } },
         models: {
             list: async () => (await this.rpc.request('get_available_models')).models.map(model => ({
                 provider: model.provider,
@@ -39,7 +73,10 @@ export class PiCliSession {
                     const model = await this.rpc.request('set_model', { provider: row.provider, modelId: row.id });
                     this.setRoute(model.provider, model.id);
                     this.contextWindow = model.contextWindow;
+                    this.acceptsImages = model.input?.includes('image');
                     await this.refreshEffort();
+                    this.emitCapacity();
+                    await this.refreshStats();
                 } catch (error) {
                     return { kind: 'refused', reason: error.message };
                 }
@@ -76,8 +113,6 @@ export class PiCliSession {
     activeTurn;
     rpc;
     contextWindow;
-    modelSpec;
-    /** The route apart as dst asks it back; `modelSpec` is what `pi` takes. */
     providerId = '';
     modelId = '';
     status = 'starting';
@@ -85,7 +120,19 @@ export class PiCliSession {
     turnNo = 0;
     stepNo = 0;
     curAttemptId = '';
-    lastUsage = -1;
+    sideQueries = new AbortController();
+    sessionCost;
+    title;
+    entryCursor;
+    liveAnchors = new Map();
+    queued = [];
+    extensionState;
+    interactions;
+    childStates = new Map();
+    acceptsImages;
+    streamed = new Set();
+    compacting = false;
+    promptInjector;
     toolSteps = new Map();
     toolOutput = new Map();
     listeners = new Set();
@@ -97,28 +144,135 @@ export class PiCliSession {
         const sid = target.native?.summary.id ?? randomUUID();
         this.sessionId = sid;
         this.piSessionId = sid;
+        this.extensionState = createPiExtensionState(sid);
+        this.interactions = new PiInteractions({
+            emit: batch => this.emitLive(batch, { replay: false }),
+            send: (record, callback) => this.rpc.send(record, callback),
+            onPendingChange: waiting => this.updateInteractionStatus(waiting),
+            debug: message => this.host.debug?.(message),
+        });
         this.ref = { backendId: 'pi-cli', sessionId: sid };
         this.sessionFile = target.native?.path;
+        this.title = target.native?.summary.title?.text;
         this.modelOverride = process.env.PI_MODEL || undefined;
-        this.modelSpec = this.modelOverride ?? '';
-        this.setRouteFromSpec();
-    }
-    /** `modelSpec` is the one source; the split is recorded for `current()`. */
-    setRouteFromSpec() {
-        const slash = this.modelSpec.indexOf('/');
-        this.providerId = slash < 0 ? this.modelSpec : this.modelSpec.slice(0, slash);
-        this.modelId = slash < 0 ? this.modelSpec : this.modelSpec.slice(slash + 1);
+        this.promptInjector = createPiPromptInjector({
+            sessionId: sid,
+            onError: message => this.emitLive([ev({ type: 'notice', level: 'warning', text: message })], { replay: false }),
+        });
     }
     setRoute(provider, id) {
         this.providerId = provider;
         this.modelId = id;
-        this.modelSpec = modelSpec(provider, id);
+    }
+    handleRpcExit(error) {
+        const wasStarting = this.status === 'starting';
+        this.sideQueries.abort();
+        this.extensionState.close();
+        this.interactions.cancelAll({ respond: false });
+        if (!wasStarting) this.setStatus('disposed');
+        if (this.activeTurn) this.finishTurn({ kind: 'error', message: error.message });
+        if (!wasStarting) this.host.warn?.(error.message);
+    }
+    async listCommands() {
+        const { commands } = await this.rpc.request('get_commands');
+        return [
+            { name: 'steer', description: 'Send an instruction at the next Pi tool boundary' },
+            { name: 'pi-tree', description: 'Show Pi branches, or inspect one with /pi-tree <entry-id>' },
+            { name: 'pi-fork', description: 'Fork a Pi tree node with /pi-fork <entry-id>' },
+            { name: 'pi-suggest', description: 'Suggest next prompts based on this conversation' },
+            ...commands.filter(({ name }) => !['steer', 'pi-tree', 'pi-fork', 'pi-suggest'].includes(name))
+                .map(({ name, description }) => ({ name, description })),
+        ];
+    }
+    async forkSession(anchor, title, rewind = false) {
+        if (this.status !== 'idle' || this.compacting) throw new Error('Wait for Pi to finish before creating a branch');
+        const path = this.sessionFile;
+        if (!path) throw new Error('Pi has no persisted session to fork');
+        const { entries, leafId } = await this.rpc.request('get_entries');
+        if (this.status !== 'idle' || this.compacting) throw new Error('Pi started another operation');
+        const id = anchor === undefined ? leafId : this.liveAnchors.get(anchor) ?? anchor;
+        const branch = piBranch(entries, id);
+        if (!id || branch.at(-1)?.id !== id) throw new Error('Pi branch entry is unavailable');
+        if (rewind) {
+            if (branch.at(-1).message?.role !== 'user') throw new Error('Choose a Pi user message to rewind');
+            branch.pop();
+        }
+        return writePiFork(path, this.sessionId, this.cwd, branch, title);
+    }
+    emitCapacity() {
+        if (this.contextWindow > 0) {
+            this.emitLive([ev({ type: 'context.capacity', contextWindow: this.contextWindow })], { replay: false });
+        }
+    }
+    async refreshStats() {
+        try {
+            const { sessionId, sessionFile, cost, contextUsage } = await this.rpc.request('get_session_stats', {}, 3000);
+            if (this.status === 'disposed' || sessionId !== this.sessionId) return;
+            this.sessionFile = sessionFile || this.sessionFile;
+            this.sessionCost = Number.isFinite(cost) ? { amount: cost, currency: 'USD', source: 'backend' } : undefined;
+            if (contextUsage?.contextWindow > 0 && contextUsage.contextWindow !== this.contextWindow) {
+                this.contextWindow = contextUsage.contextWindow;
+                this.emitCapacity();
+            }
+            if (contextUsage?.tokens != null) {
+                this.emitLive([ev({ type: 'context.usage', used: contextUsage.tokens, max: contextUsage.contextWindow })], { replay: false });
+            }
+        } catch (error) {
+            this.host.debug?.(error.message);
+        }
+    }
+    async refreshRuntimeState(state, { emitCapacity = true } = {}) {
+        state ??= await this.rpc.request('get_state');
+        if (state.sessionId && state.sessionId !== this.sessionId) {
+            throw new Error('Pi RPC switched to a different session');
+        }
+        const previousWindow = this.contextWindow;
+        if (state.model) {
+            this.setRoute(state.model.provider, state.model.id);
+            if (Number.isFinite(state.model.contextWindow)) this.contextWindow = state.model.contextWindow;
+            this.acceptsImages = state.model.input?.includes('image');
+        }
+        this.sessionFile = state.sessionFile || this.sessionFile;
+        if (emitCapacity && this.contextWindow > 0 && this.contextWindow !== previousWindow) {
+            this.emitCapacity();
+        }
+        return state;
+    }
+    async captureAnchors(turn) {
+        try {
+            const fields = this.entryCursor ? { since: this.entryCursor } : {};
+            const { entries } = await this.rpc.request('get_entries', fields, 3000);
+            this.entryCursor = entries.at(-1)?.id ?? this.entryCursor;
+            const users = entries.filter(entry => entry.message?.role === 'user');
+            if (users.length > 0 && users.length === turn.userAnchors.length) {
+                users.forEach((entry, index) => this.liveAnchors.set(turn.userAnchors[index], entry.id));
+                if (!this.title && this.status !== 'disposed') {
+                    const title = messageText(users[0].message).replace(/\s+/g, ' ').trim().slice(0, 160);
+                    if (title) {
+                        this.title = title;
+                        this.emitLive([ev({ type: 'session.title', title, source: 'auto' })], { replay: false });
+                    }
+                }
+                const assistants = entries.filter(entry => entry.message?.role === 'assistant');
+                if (assistants.length === turn.assistants.length) {
+                    assistants.forEach((entry, index) => {
+                        if (turn.assistants[index]) this.liveAnchors.set(turn.assistants[index], entry.id);
+                    });
+                }
+            }
+        } catch (error) {
+            this.host.debug?.(error.message);
+        }
     }
     async runCompact() {
-        if (this.status !== 'idle' || this.activeTurn) throw new Error('Pi is running a turn; compact after it finishes');
+        if (this.status !== 'idle' || this.activeTurn || this.compacting) throw new Error('Pi is running a turn; compact after it finishes');
         if (this.rpc === undefined) throw new Error('Pi session is not open');
         // Pi aborts any in-flight work itself and summarizes the active branch.
-        await this.rpc.request('compact', {}, 600_000);
+        this.compacting = true;
+        try {
+            await this.rpc.request('compact', {}, 600_000);
+            await this.refreshStats();
+        } finally { this.compacting = false; }
     }
     async refreshEffort(state) {
         const { levels } = await this.rpc.request('get_available_thinking_levels');
@@ -142,7 +296,6 @@ export class PiCliSession {
                 else if (lastModel) this.setRoute(lastModel.message.provider, lastModel.message.model);
             }
             for (const entry of branch) this.replayEntry(entry);
-            if (this.turnNo) this.pushHistory([ev({ type: 'turn.end', turn: this.turnNo, reason: { kind: 'completed' }, time: Date.now() })]);
         }
         const args = ['--mode', 'rpc'];
         if (this.sessionFile) args.push('--session', this.sessionFile);
@@ -150,29 +303,41 @@ export class PiCliSession {
         if (this.modelOverride) args.push('--model', this.modelOverride);
         this.rpc = new PiRpc(args, this.cwd, record => this.onRecord(record), (error, closing) => {
             if (closing || this.status === 'disposed') return;
-            if (this.activeTurn) this.finishTurn({ kind: 'error', message: error.message });
-            if (this.status !== 'starting') {
-                this.setStatus('disposed');
-                this.host.warn(error.message);
-            }
+            this.handleRpcExit(error);
         });
         try {
-            const state = await this.rpc.request('get_state');
-            if (state.sessionId !== this.sessionId) throw new Error('Pi RPC opened a different session');
-            if (state.model) {
-                this.setRoute(state.model.provider, state.model.id);
-                this.contextWindow = state.model.contextWindow;
+            const state = await this.refreshRuntimeState(undefined, { emitCapacity: false });
+            if (this.turnNo) {
+                try {
+                    const { entries } = await this.rpc.request('get_entries', {}, 3000);
+                    this.entryCursor = entries.at(-1)?.id;
+                } catch (error) {
+                    this.host.debug?.(error.message);
+                }
             }
             await this.refreshEffort(state);
+            await this.refreshStats();
+            if (this.turnNo) this.pushHistory([ev({ type: 'turn.end', turn: this.turnNo,
+                reason: { kind: 'completed' }, time: Date.now(), cost: this.sessionCost })]);
+            this.title = state.sessionName || this.title;
+            const ready = [
+                ev({ type: 'session.ready', sessionId: this.sessionId, cwd: this.cwd, model: this.modelId,
+                    provider: this.providerId, contextWindow: this.contextWindow, title: this.title, effort: this.thinkingLevel }),
+                ev({ type: 'mode.changed', modeId: 'Pi native' }),
+            ];
+            if (this.title) ready.push(ev({ type: 'session.title', title: this.title, source: state.sessionName ? 'user' : 'auto' }));
+            this.emitLive(ready, { replay: false });
         } catch (error) {
+            this.interactions.cancelAll({ respond: false });
+            this.extensionState.close();
             await this.rpc.close();
             throw error;
         }
-        this.emitLive([ev({ type: 'session.ready', sessionId: this.sessionId, cwd: this.cwd, model: this.modelSpec, provider: this.providerId })], { replay: false });
         this.setStatus('idle');
+        if (this.interactions.hasPending()) this.setStatus('requires-action');
     }
     replayEntry(o) {
-        if (o?.type === 'compaction') {
+        if (o?.type === 'compaction' || o?.type === 'branch_summary') {
             // A checkpoint in the native file is settled history: show its summary
             // the same way a live compaction does.
             const summary = typeof o.summary === 'string' ? o.summary.trim() : '';
@@ -190,6 +355,7 @@ export class PiCliSession {
         const m = o.message;
         if (!m)
             return;
+        const time = Date.parse(o.timestamp) || Date.now();
         const blocks = Array.isArray(m.content) ? m.content : [];
         const thinkingText = blocks.filter(block => block?.type === 'thinking')
             .map(block => block.thinking ?? block.text ?? '').join('\n');
@@ -200,179 +366,189 @@ export class PiCliSession {
             this.toolSteps.clear();
             const text = messageText(m);
             this.pushHistory([
-                ev({ type: 'turn.start', turn: this.turnNo, origin: 'user', time: Date.now() }),
-                ev({ type: 'user.message', id: `h-u-${this.turnNo}`, anchor: '', seq: ++this.seq, turn: this.turnNo, time: Date.now(), source: 'user', text, blocks: [{ type: 'text', text }] }),
+                ev({ type: 'turn.start', turn: this.turnNo, origin: 'user', time }),
+                ev({ type: 'user.message', id: `h-u-${this.turnNo}`, anchor: o.id ?? '', seq: ++this.seq, turn: this.turnNo, time, source: 'user', text, blocks: [{ type: 'text', text }], images: piTranscriptImages(m.content, o.id ?? `h-u-${this.turnNo}`) }),
             ]);
             return;
         }
         if (m.role === 'assistant') {
-            for (const tc of blocks.filter((b) => b?.type === 'toolCall')) {
-                this.stepNo += 1;
-                this.toolSteps.set(tc.id, this.stepNo);
-                this.pushHistory([
-                    ev({
-                        type: 'tool.call',
-                        seq: ++this.seq,
-                        turn: this.turnNo,
-                        step: this.stepNo,
-                        callId: tc.id,
-                        name: tc.name,
-                        argsJson: JSON.stringify(tc.arguments ?? {}),
-                        time: Date.now(),
-                    }),
-                ]);
-            }
             const text = messageText(m);
-            const thinking = thinkingText;
-            if (!text && !thinking)
-                return;
-            this.stepNo += 1;
-            const att = `h-att-${this.turnNo}-${this.stepNo}`;
-            const steps = [ev({ type: 'assistant.attempt.start', attemptId: att, turn: this.turnNo, step: this.stepNo, model: this.modelSpec })];
-            if (thinking)
-                steps.push(ev({ type: 'assistant.delta', attemptId: att, index: 0, time: Date.now(), turn: this.turnNo, step: this.stepNo, delta: { kind: 'reasoning', text: thinking } }));
-            if (text)
-                steps.push(ev({ type: 'assistant.delta', attemptId: att, index: 0, time: Date.now(), turn: this.turnNo, step: this.stepNo, delta: { kind: 'text', text } }));
-            steps.push(this.assistantMessage(att, text, thinking, o.id, Date.parse(o.timestamp) || Date.now()));
-            steps.push(ev({ type: 'assistant.attempt.end', attemptId: att, turn: this.turnNo, step: this.stepNo, outcome: 'committed' }));
-            this.pushHistory(steps);
-            return;
-        }
-        if (m.role === 'toolResult') {
-            const step = this.toolSteps.get(m.toolCallId) ?? this.stepNo;
-            const out = blocks.filter((b) => b?.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('');
-            this.pushHistory([
-                ev({ type: 'tool.result', seq: ++this.seq, turn: this.turnNo, step, callId: m.toolCallId, isError: !!m.isError, time: Date.now(), content: [], text: out }),
-            ]);
+            if (text || thinkingText) {
+                this.stepNo += 1;
+                const att = `h-att-${this.turnNo}-${this.stepNo}`;
+                this.pushHistory([this.assistantMessage(att, text, thinkingText, o.id, time, m.model)]);
+            }
+            this.pushHistory(this.usageEvents(m, time));
+            for (const call of blocks.filter(block => block?.type === 'toolCall')) {
+                this.pushHistory([this.toolCall(call.id, call.name, call.arguments, time)]);
+            }
+        } else if (m.role === 'toolResult') {
+            this.pushHistory([this.toolResult(m.toolCallId, m, m.isError, time), ...this.toolState(m.toolCallId, m.toolName, m, true, m.isError, time)]);
         }
     }
     onEvent(e) {
-        const t = e?.type;
-        if (t === 'message_end') {
-            this.onMessageEnd(e);
+        switch (e.type) {
+        case 'message_update': {
+            if (e.message && e.message.role !== 'assistant') return;
+            const update = e.assistantMessageEvent;
+            const kind = update?.type === 'text_delta' ? 'text'
+                : update?.type === 'thinking_delta' ? 'reasoning' : undefined;
+            if (kind && update.delta) {
+                this.openIfNeeded();
+                this.streamed.add(kind);
+                this.emitDelta(kind, update.delta, update.contentIndex);
+            }
+            break;
         }
-        else if (t === 'tool_execution_start') {
-            this.onToolStart(e);
+        case 'message_start':
+            if (e.message?.role === 'user') this.onNativeUser(e.message);
+            break;
+        case 'message_end': this.onMessageEnd(e.message); break;
+        case 'tool_execution_start':
+            this.emitLive([this.toolCall(e.toolCallId, e.toolName, e.args)], { replay: false });
+            break;
+        case 'tool_execution_update': this.onToolUpdate(e); break;
+        case 'tool_execution_end':
+            this.emitLive([this.toolResult(e.toolCallId, e.result, e.isError),
+                ...this.toolState(e.toolCallId, e.toolName, e.result, true, e.isError)], { replay: false });
+            this.toolOutput.delete(e.toolCallId);
+            break;
         }
-        else if (t === 'tool_execution_update') {
-            this.onToolUpdate(e);
-        }
-        else if (t === 'tool_execution_end') {
-            this.onToolEnd(e);
-        }
-        else if (t === 'message_update' && e.usage) {
-            this.onUsage(e.usage);
-        }
-        // turn_start / turn_end / agent_* are synthesized locally; ignored here.
+    }
+    emitDelta(kind, text, index = 0) {
+        this.emitLive([ev({ type: 'assistant.delta', attemptId: this.curAttemptId, index, time: Date.now(),
+            turn: this.turnNo, step: this.stepNo, delta: { kind, text } })], { replay: false, wake: 'frame' });
     }
     openIfNeeded() {
         if (this.curAttemptId)
             return;
         this.stepNo += 1;
         this.curAttemptId = `att${this.turnNo}_${this.stepNo}`;
-        this.emitLive([ev({ type: 'assistant.attempt.start', attemptId: this.curAttemptId, turn: this.turnNo, step: this.stepNo, model: this.modelSpec })], { replay: false });
+        this.emitLive([ev({ type: 'assistant.attempt.start', attemptId: this.curAttemptId, turn: this.turnNo, step: this.stepNo, model: this.modelId })], { replay: false });
     }
     closeAttempt() {
         if (!this.curAttemptId)
             return;
         this.emitLive([ev({ type: 'assistant.attempt.end', attemptId: this.curAttemptId, turn: this.turnNo, step: this.stepNo, outcome: 'committed' })], { replay: false });
         this.curAttemptId = '';
+        this.streamed.clear();
     }
-    assistantMessage(attemptId, text, thinking, anchor = attemptId, time = Date.now()) {
+    assistantMessage(attemptId, text, thinking, anchor = attemptId, time = Date.now(), model = this.modelId) {
         const blocks = [];
         if (thinking) blocks.push({ type: 'reasoning', text: thinking });
         if (text) blocks.push({ type: 'text', text });
         return ev({ type: 'assistant.message', seq: ++this.seq, anchor, attemptId, time,
-            turn: this.turnNo, step: this.stepNo, model: this.modelSpec, blocks, canonical: true });
+            turn: this.turnNo, step: this.stepNo, model, blocks, canonical: true });
     }
-    onMessageEnd(e) {
-        // Use Pi's final message blocks as the canonical transcript entry.
-        const msg = e?.message;
-        if (!msg || msg.role !== 'assistant')
-            return;
-        const blocks = Array.isArray(msg.content) ? msg.content : [];
-        const text = blocks.filter((b) => b?.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n');
-        const thinking = blocks.filter(block => block?.type === 'thinking')
+    onMessageEnd(msg) {
+        if (msg?.role !== 'assistant') return;
+        const text = messageText(msg);
+        const thinking = (Array.isArray(msg.content) ? msg.content : []).filter(block => block?.type === 'thinking')
             .map(block => block.thinking ?? block.text ?? '').join('\n');
-        if (!text && !thinking)
-            return;
-        this.openIfNeeded();
-        const att = this.curAttemptId;
-        if (thinking)
-            this.emitLive([ev({ type: 'assistant.delta', attemptId: att, index: 0, time: Date.now(), turn: this.turnNo, step: this.stepNo, delta: { kind: 'reasoning', text: thinking } })], { replay: false });
-        if (text)
-            this.emitLive([ev({ type: 'assistant.delta', attemptId: att, index: 0, time: Date.now(), turn: this.turnNo, step: this.stepNo, delta: { kind: 'text', text } })], { replay: false });
-        this.emitLive([this.assistantMessage(att, text, thinking)], { replay: false });
+        let anchor;
+        if (text || thinking) {
+            this.openIfNeeded();
+            if (thinking && !this.streamed.has('reasoning')) this.emitDelta('reasoning', thinking);
+            if (text && !this.streamed.has('text')) this.emitDelta('text', text);
+            anchor = this.curAttemptId;
+            this.emitLive([this.assistantMessage(anchor, text, thinking)], { replay: false });
+        }
+        this.activeTurn.assistants.push(anchor);
+        this.emitLive(this.usageEvents(msg), { replay: false });
         this.closeAttempt();
     }
-    onToolStart(e) {
-        this.stepNo += 1;
-        this.toolSteps.set(e.toolCallId, this.stepNo);
-        this.toolOutput.set(e.toolCallId, '');
-        this.emitLive([ev({
-                type: 'tool.call',
-                seq: ++this.seq,
-                turn: this.turnNo,
-                step: this.stepNo,
-                callId: e.toolCallId,
-                name: e.toolName,
-                argsJson: JSON.stringify(e.args ?? {}),
-                time: Date.now(),
-            })], { replay: false });
-        // A tool closes the current reasoning/text attempt so text after the tool opens a new step.
-        this.curAttemptId = '';
+    usageEvents(message, time = Date.now()) {
+        const { usage } = message;
+        if (!usage || !(usage.totalTokens > 0 || usage.input || usage.output || usage.cacheRead || usage.cacheWrite)) return [];
+        return [ev({ type: 'usage', seq: ++this.seq, turn: this.turnNo, step: this.stepNo,
+            model: message.model, time, usage: {
+                input: usage.input ?? 0, output: usage.output ?? 0,
+                cacheRead: usage.cacheRead ?? 0, cacheWrite: usage.cacheWrite ?? 0,
+            } })];
+    }
+    toolCall(callId, name, args, time = Date.now()) {
+        const step = ++this.stepNo;
+        this.toolSteps.set(callId, { step, name, args });
+        return ev({ type: 'tool.call', seq: ++this.seq, turn: this.turnNo, step, callId, name,
+            argsJson: JSON.stringify(args ?? {}), presentation: piToolCall(name, args, this.cwd), time });
     }
     onToolUpdate(e) {
-        const cur = this.toolOutput.get(e.toolCallId) ?? '';
-        const o = e.output;
-        let next = cur;
-        if (o) {
-            if ('set' in o && o.set !== undefined)
-                next = o.set;
-            else if (typeof o.append === 'string')
-                next += o.append;
-        }
-        this.toolOutput.set(e.toolCallId, next);
+        this.emitLive(this.toolState(e.toolCallId, e.toolName, e.partialResult, false, false), { replay: false, wake: 'frame' });
+        const text = messageText(e.partialResult);
+        const previous = this.toolOutput.get(e.toolCallId) ?? '';
+        this.toolOutput.set(e.toolCallId, text);
+        const delta = text.startsWith(previous) ? text.slice(previous.length) : text ? '\n' + text : '';
+        if (delta) this.emitLive([ev({ type: 'tool.output', callId: e.toolCallId, text: delta, time: Date.now() })],
+            { replay: false, wake: 'frame' });
     }
-    onToolEnd(e) {
-        const step = this.toolSteps.get(e.toolCallId) ?? this.stepNo;
-        const res = e.result;
-        let out = '';
-        if (res) {
-            if (typeof res.structuredContent === 'string')
-                out = res.structuredContent;
-            else if (Array.isArray(res.content))
-                out = res.content.map((b) => b?.text ?? '').join('');
-        }
-        this.emitLive([ev({
-                type: 'tool.result',
-                seq: ++this.seq,
-                turn: this.turnNo,
-                step,
-                callId: e.toolCallId,
-                isError: !!e.isError,
-                time: Date.now(),
-                content: [],
-                text: out,
-            })], { replay: false });
+    toolResult(callId, result, isError, time = Date.now()) {
+        const call = this.toolSteps.get(callId);
+        const text = messageText(result) || (typeof result?.structuredContent === 'string' ? result.structuredContent : '');
+        return ev({ type: 'tool.result', seq: ++this.seq, turn: this.turnNo, step: call?.step ?? this.stepNo,
+            callId, isError: Boolean(isError), time, content: text ? [{ type: 'text', text }] : [], text,
+            images: piTranscriptImages(result?.content, callId),
+            errorText: isError ? text : undefined, presentation: piToolResult(call?.name, call?.args, result, isError) });
     }
-    onUsage(u) {
-        const input = (u?.input ?? 0) + (u?.cacheRead ?? 0);
-        const output = u?.output ?? 0;
-        // pi repeats the same usage on every message_update; emit only on change.
-        const used = input + output;
-        if (used === this.lastUsage)
+    toolState(id, name, result, final, isError, time = Date.now()) {
+        name ||= this.toolSteps.get(id)?.name;
+        if (name === 'subagent') return piSubagents(id, result?.details, this.childStates, time, final, isError);
+        const todo = final && !isError && piTodos(name, result?.details);
+        return todo ? [todo] : [];
+    }
+    emitPending(change = {}) {
+        this.emitLive([{ type: 'pending.changed',
+            items: this.queued.map(({ id, text, placement }) => ({ id, text, placement })), ...change }], { replay: false });
+    }
+    onNativeUser(message) {
+        const turn = this.activeTurn;
+        if (!turn.receivedInitialUser) {
+            turn.receivedInitialUser = true;
             return;
-        this.lastUsage = used;
-        if (this.contextWindow) this.emitLive([ev({ type: 'context.usage', used, max: this.contextWindow })], { replay: false });
+        }
+        const actual = messageText(message);
+        const exact = this.queued.findIndex(entry => entry.message.trim() === actual.trim());
+        const index = exact >= 0 ? exact : this.queued.findIndex(entry => entry.placement === 'steer');
+        const queued = index >= 0 ? this.queued.splice(index, 1)[0] : this.queued.shift();
+        if (!queued) return;
+        const anchor = `pi-user-${randomUUID()}`;
+        turn.userAnchors.push(anchor);
+        this.emitPending({ claimed: [queued.id] });
+        this.emitLive([{ type: 'user.message', id: queued.id, anchor, seq: ++this.seq,
+            turn: this.turnNo, time: Date.now(), source: queued.placement === 'steer' ? 'injected' : 'user',
+            label: queued.placement === 'steer' ? 'steering' : undefined, text: queued.text,
+            blocks: [{ type: 'text', text: actual }], images: queued.images }], { replay: false });
+    }
+    async submitQueued(input, placement, message, images) {
+        const queued = { id: input.clientMessageId, text: input.text, placement, message, images: input.images };
+        this.queued.push(queued);
+        this.emitPending();
+        try {
+            const response = await this.rpc.request(placement === 'steer' ? 'steer' : 'follow_up', { message, images });
+            if (response?.disposition === 'handled' && this.queued.includes(queued)) {
+                this.queued = this.queued.filter(item => item !== queued);
+                this.emitPending({ claimed: [queued.id] });
+            }
+            return { accepted: true };
+        } catch (error) {
+            this.queued = this.queued.filter(item => item !== queued);
+            this.emitPending({ discarded: [queued.id] });
+            return { accepted: false, reason: error.message };
+        }
     }
     setStatus(status) {
         this.status = status;
         this.emitLive([ev({ type: 'session.status', status })], { replay: false });
     }
+    updateInteractionStatus(waiting) {
+        if (this.status === 'starting' || this.status === 'disposed') return;
+        const status = waiting ? 'requires-action' : this.activeTurn ? 'running' : 'idle';
+        if (status !== this.status) this.setStatus(status);
+    }
     emitLive(batch, meta) {
-        for (const e of batch)
-            this.historyEvents.push(e);
+        if (!batch.length) return;
+        for (const e of batch) {
+            if (!['assistant.delta', 'tool.output'].includes(e.type)) this.historyEvents.push(e);
+        }
         if (this.listeners.size === 0) {
             this.earlyEvents.push(...batch);
             return;
@@ -399,51 +575,147 @@ export class PiCliSession {
             this.listeners.delete(listener);
         };
     }
-    async submit(input, _placement) {
-        if (this.status !== 'idle' || this.activeTurn)
-            return { accepted: false, reason: 'Pi session is not idle' };
-        if (input.blocks?.some(block => block.type !== 'text') || input.images?.length || input.attachments?.length)
-            return { accepted: false, reason: 'Pi CLI backend currently accepts text only' };
+    async runLocalCommand(input, command, anchor) {
+        this.emitLive([ev({ type: 'pending.changed', items: [], claimed: [input.clientMessageId] })], { replay: false });
+        let text;
+        let level = 'info';
+        const zh = this.host.locale?.() === 'zh';
+        try {
+            if (anchor && (command === '/pi-suggest' || /\s/.test(anchor))) {
+                throw new Error(zh ? `参数无效：${command}` : `Invalid arguments for ${command}`);
+            }
+            if (command === '/pi-suggest') {
+                const locale = zh ? 'Chinese' : 'English';
+                const result = await this.capabilities.sideQuery.ask(
+                    `Suggest 2 or 3 distinct next messages the user could send to advance this conversation. Write concise, copyable prompts in ${locale}.`);
+                if (result.answer === null && !result.error) return { accepted: true };
+                if (result.error) throw new Error(result.error);
+                text = result.answer;
+            } else if (command === '/pi-fork') {
+                if (!anchor) throw new Error(zh ? '用法：/pi-fork <节点 ID>' : 'Usage: /pi-fork <entry-id>');
+                const forked = await this.forkSession(anchor);
+                text = zh ? `已派生 Pi 会话。使用 /resume ${forked.sessionId} 打开。`
+                    : `Created a Pi branch. Open it with /resume ${forked.sessionId}.`;
+            } else {
+                const { entries, leafId } = await this.rpc.request('get_entries');
+                const active = new Set(piBranch(entries, leafId).map(entry => entry.id));
+                const branch = anchor ? piBranch(entries, anchor) : entries;
+                if (anchor && branch.at(-1)?.id !== anchor) throw new Error(zh ? '找不到该 Pi 节点' : 'Pi tree entry was not found');
+                const nearestUser = new Map();
+                const lines = [];
+                for (const entry of branch) {
+                    const parent = nearestUser.get(entry.parentId);
+                    const isUser = entry.message?.role === 'user';
+                    nearestUser.set(entry.id, isUser ? entry.id : parent);
+                    if (!isUser) continue;
+                    const preview = messageText(entry.message).replace(/\s+/g, ' ').slice(0, 65);
+                    lines.push(`${active.has(entry.id) ? '●' : '○'} ${entry.id} ← ${parent ?? '∅'}  ${preview}`);
+                }
+                const title = zh ? 'Pi 会话树（● 当前分支，○ 其他分支）' : 'Pi session tree (● active branch, ○ other branch)';
+                const trimmed = lines.length > 100 ? [zh ? '… 较早的节点已省略' : '… earlier entries omitted'] : [];
+                text = [title, ...trimmed, ...lines.slice(-100)].join('\n');
+            }
+        } catch (error) {
+            level = 'error';
+            text = error.message;
+        }
+        if (text && this.status !== 'disposed') {
+            const event = level === 'error' ? { type: 'notice', level, text } : {
+                type: 'user.message', id: input.clientMessageId, anchor: '', seq: ++this.seq,
+                turn: this.turnNo, time: Date.now(), source: 'command-output', displayLive: true,
+                label: command, text, blocks: [{ type: 'text', text }],
+            };
+            this.emitLive([event], { replay: false });
+        }
+        return { accepted: true };
+    }
+    async submit(input, placement) {
+        let text = input.text;
+        let message = input.blocks?.filter(block => block.type === 'text').map(block => block.text ?? '').join('\n') ?? text;
+        const steer = /^\/steer(?:\s+|$)/i;
+        if (steer.test(text.trimStart())) {
+            text = text.trimStart().replace(steer, '').trim();
+            message = message.trimStart().replace(steer, '').trim();
+            if (!text) return { accepted: false, reason: 'Usage: /steer <message>' };
+            if (!this.activeTurn) return { accepted: false, reason: 'Pi has no active turn to steer' };
+            placement = 'steer';
+            input = { ...input, text };
+        }
+        if (input.blocks?.some(block => !['text', 'image'].includes(block.type)) || input.attachments?.length) {
+            return { accepted: false, reason: 'Pi supports text and image input' };
+        }
+        if (input.blocks?.some(block => block.type === 'image') && !input.images?.length) {
+            return { accepted: false, reason: 'Pi image attachments could not be loaded' };
+        }
+        if (input.images?.length && this.acceptsImages === false) {
+            return { accepted: false, reason: 'The selected Pi model does not support image input' };
+        }
+        let images;
+        try { if (input.images?.length) images = await piImageInputs(input.images); }
+        catch (error) { return { accepted: false, reason: error.message }; }
+        const local = /^(\/pi-suggest|\/pi-tree|\/pi-fork)(?:\s+([\s\S]+))?$/.exec(text.trim());
+        if (local && this.status === 'idle' && !this.compacting) return this.runLocalCommand(input, local[1], local[2]);
+        if (local) return { accepted: false, reason: 'Pi session is not idle' };
+        if (this.activeTurn && !this.activeTurn.settling && !this.activeTurn.cancelling && ['steer', 'followup'].includes(placement)) {
+            return this.submitQueued(input, placement, message, images);
+        }
+        if (this.status !== 'idle' || this.activeTurn || this.compacting) {
+            return { accepted: false, reason: 'Pi session is not idle', dropped: true };
+        }
         let resolveTurn;
         const done = new Promise(resolve => { resolveTurn = resolve; });
-        const turn = { done, resolve: resolveTurn, cancelled: false };
+        const anchor = `pi-user-${randomUUID()}`;
+        const turn = { done, resolve: resolveTurn, cancelled: false, userAnchors: [anchor], assistants: [] };
         this.activeTurn = turn;
         this.turnNo += 1;
         this.stepNo = 0;
         this.toolSteps.clear();
         this.toolOutput.clear();
+        this.childStates.clear();
         this.curAttemptId = '';
-        const text = input.text;
+        this.emitPending({ claimed: [input.clientMessageId] });
         this.emitLive([
-            ev({ type: 'pending.changed', items: [], claimed: [input.clientMessageId] }),
             ev({ type: 'turn.start', turn: this.turnNo, origin: 'user', time: Date.now() }),
-            ev({ type: 'user.message', id: input.clientMessageId, anchor: '', seq: ++this.seq,
-                turn: this.turnNo, time: Date.now(), source: 'user', text, blocks: [{ type: 'text', text }] }),
+            ev({ type: 'user.message', id: input.clientMessageId, anchor, seq: ++this.seq,
+                turn: this.turnNo, time: Date.now(), source: 'user', text, blocks: [{ type: 'text', text: message }], images: input.images }),
         ], { replay: false });
         this.setStatus('running');
         try {
-            const response = await this.rpc.request('prompt', { message: text });
+            const response = await this.rpc.request('prompt', { message, images });
             if (this.activeTurn === turn && response?.disposition === 'handled') {
-                this.finishTurn({ kind: turn.cancelled ? 'aborted' : 'completed' });
+                await this.settleTurn(turn, { kind: turn.cancelled ? 'aborted' : 'completed' });
             }
         } catch (error) {
             if (this.activeTurn === turn) {
                 if (error.code === 'PI_RPC_TIMEOUT') {
                     this.setStatus('disposed');
+                    this.extensionState.close();
+                    this.interactions.cancelAll({ respond: false });
                     await this.rpc.close();
                 }
                 this.finishTurn({ kind: 'error', message: error.message });
             }
         }
-        await done;
         return { accepted: true };
     }
     onRecord(record) {
         if (record.type === 'extension_ui_request') {
-            // Dismiss dialogs without approving an action the frontend cannot display.
-            if (['select', 'confirm', 'input', 'editor'].includes(record.method)) {
-                this.rpc.send({ type: 'extension_ui_response', id: record.id, cancelled: true }, () => {});
+            if (record.method === 'set_editor_text') {
+                if (typeof record.text === 'string' && record.text !== '') void this.promptInjector(record.text);
+                return;
             }
+            if (record.method === 'setTitle' && typeof record.title === 'string') {
+                const title = record.title.trim();
+                if (title) {
+                    this.title = title;
+                    this.emitLive([ev({ type: 'session.title', title, source: 'auto' })], { replay: false });
+                }
+                return;
+            }
+            if (record.method === 'notify' && typeof record.message === 'string') {
+                const level = ['warning', 'error'].includes(record.notifyType) ? record.notifyType : 'notice';
+                this.emitLive([{ type: 'notice', level, text: record.message }], { replay: false });
+            } else if (!this.interactions.handle(record)) this.extensionState.update(record);
             return;
         }
         if (record.type === 'thinking_level_changed') {
@@ -487,37 +759,71 @@ export class PiCliSession {
         if (message?.role === 'assistant') {
             turn.error = message.stopReason === 'error' ? message.errorMessage || 'Pi provider failed' : undefined;
             turn.aborted = message.stopReason === 'aborted';
-            if (message.model) this.setRoute(message.provider, message.model);
+            if (message.model && (message.model !== this.modelId || message.provider !== this.providerId)) {
+                this.setRoute(message.provider, message.model);
+                this.emitLive([ev({ type: 'model.changed', model: this.modelId, provider: this.providerId, source: 'fallback' })], { replay: false });
+            }
         }
         if (record.type === 'agent_settled') {
-            const reason = turn.cancelled || turn.aborted ? { kind: 'aborted' }
+            const reason = record.aborted || turn.cancelled || turn.aborted ? { kind: 'aborted' }
                 : turn.error ? { kind: 'error', message: turn.error } : { kind: 'completed' };
-            this.finishTurn(reason);
+            void this.settleTurn(turn, reason);
         } else this.onEvent(record);
+    }
+    async settleTurn(turn, reason) {
+        if (turn.settling) return;
+        turn.settling = true;
+        await Promise.all([
+            this.refreshStats(),
+            this.captureAnchors(turn),
+            this.refreshRuntimeState().catch(error => this.host.debug?.(error.message)),
+        ]);
+        if (this.activeTurn === turn) this.finishTurn(turn.cancelled ? { kind: 'aborted' } : reason);
     }
     finishTurn(reason) {
         const turn = this.activeTurn;
         if (!turn) return;
         this.activeTurn = undefined;
         this.closeAttempt();
-        this.emitLive([ev({ type: 'turn.end', turn: this.turnNo, reason, time: Date.now() })], { replay: false });
-        if (this.status !== 'disposed') this.setStatus('idle');
+        if (this.queued.length) {
+            const ids = this.queued.splice(0).map(item => item.id);
+            this.emitPending(this.status === 'disposed' ? { discarded: ids } : { dropped: ids });
+        }
+        for (const [agentId, owner] of this.childStates) {
+            if (owner !== 'ended') this.emitLive([{ type: 'subagent.end', agentId,
+                status: reason.kind === 'aborted' ? 'cancelled' : 'unknown', time: Date.now() }], { replay: false });
+        }
+        this.emitLive([ev({ type: 'turn.end', turn: this.turnNo, reason, time: Date.now(), cost: this.sessionCost })], { replay: false });
+        if (this.status !== 'disposed') {
+            this.setStatus(this.interactions.hasPending() ? 'requires-action' : 'idle');
+        }
         turn.resolve();
     }
-    async cancel(_cause) {
+    async cancel(cause) {
         const turn = this.activeTurn;
         if (!turn) return { stillQueued: [], outcome: 'confirmed' };
-        turn.cancelled = true;
+        const covered = this.queued.map(item => item.id);
+        turn.cancelling = true;
         try {
+            this.interactions.cancelAll();
+            if (cause !== 'user') {
+                await this.rpc.request('clear_queue');
+                const discarded = this.queued.splice(0).map(item => item.id);
+                if (discarded.length) this.emitPending({ discarded });
+            }
+            turn.cancelled = true;
             await this.rpc.request('abort');
             await turn.done;
             return { stillQueued: [], outcome: 'confirmed' };
         } catch {
-            return { stillQueued: [], outcome: 'unknown' };
-        }
+            return { stillQueued: this.queued.map(item => item.id), outcome: 'unknown' };
+        } finally { turn.cancelling = false; }
     }
     async dispose() {
         this.status = 'disposed';
+        this.sideQueries.abort();
+        this.extensionState.close();
+        this.interactions.cancelAll();
         this.listeners.clear();
         if (this.activeTurn) this.activeTurn.cancelled = true;
         await this.rpc?.close();

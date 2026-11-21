@@ -1,6 +1,7 @@
-import { open, readdir, readFile, realpath } from 'node:fs/promises';
+import { open, readdir, readFile, realpath, rename, unlink } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { basename, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 
 function absolute(path) {
     return resolve(path === '~' ? homedir() : path.startsWith('~/') ? join(homedir(), path.slice(2)) : path);
@@ -124,18 +125,54 @@ export async function requirePiSessionFile(path, id, cwd) {
 }
 
 export async function readPiBranch(path) {
-    const all = entries(await readFile(path, 'utf8')).slice(1);
+    const [, ...all] = entries(await readFile(path, 'utf8'));
+    return piBranch(all, all.findLast(item => typeof item.id === 'string')?.id);
+}
+
+export function piBranch(all, leafId) {
     const byId = new Map(all.filter(entry => typeof entry.id === 'string').map(entry => [entry.id, entry]));
     if (!byId.size) return all;
     const branch = [];
     const seen = new Set();
-    let entry = all.findLast(item => typeof item.id === 'string');
+    let entry = byId.get(leafId);
     while (entry && !seen.has(entry.id)) {
         branch.push(entry);
         seen.add(entry.id);
         entry = byId.get(entry.parentId);
     }
     return branch.reverse();
+}
+
+// Pi's RPC fork/clone switches its active session. Persist a native child
+// directly so a dsh-tui fork leaves the original RPC session bound.
+export async function writePiFork(path, sessionId, cwd, branch, title) {
+    const source = await open(path, 'r');
+    let parent;
+    try {
+        const buffer = Buffer.alloc(WINDOW);
+        const { bytesRead } = await source.read(buffer, 0, buffer.length, 0);
+        const head = buffer.toString('utf8', 0, bytesRead);
+        [parent] = entries(head.slice(0, head.indexOf('\n') + 1));
+    } finally { await source.close(); }
+    if (parent?.type !== 'session' || parent.id !== sessionId) throw new Error('Pi session file changed');
+    const id = randomUUID();
+    const timestamp = new Date().toISOString();
+    const header = { ...parent, id, cwd, timestamp, parentSession: path };
+    const copied = branch.slice();
+    if (title) copied.push({
+        type: 'session_info', id: randomUUID().slice(0, 8),
+        parentId: copied.at(-1)?.id ?? null, timestamp, name: title,
+    });
+    const destination = join(dirname(path), `${timestamp.replace(/[:.]/g, '-')}_${id}.jsonl`);
+    const temporary = `${destination}.tmp`;
+    const data = [header, ...copied].map(entry => JSON.stringify(entry)).join('\n') + '\n';
+    const output = await open(temporary, 'wx', 0o600);
+    try {
+        try { await output.writeFile(data); }
+        finally { await output.close(); }
+        await rename(temporary, destination);
+    } finally { await unlink(temporary).catch(() => {}); }
+    return { backendId: 'pi-cli', sessionId: id };
 }
 
 export function createPiCliCatalog() {

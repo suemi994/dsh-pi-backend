@@ -1,0 +1,215 @@
+import assert from 'node:assert/strict';
+import { tmpdir } from 'node:os';
+import test from 'node:test';
+import { PiCliSession } from '../session.js';
+
+function fixtureSession() {
+    const warnings = [];
+    const debug = [];
+    const session = new PiCliSession({ kind: 'new', cwd: tmpdir() }, {
+        cwd: tmpdir(),
+        locale: () => 'en',
+        debug(message) { debug.push(message); },
+        warn(message) { warnings.push(message); },
+    });
+    session.status = 'idle';
+    const events = [];
+    session.subscribe(batch => events.push(...batch));
+    return { session, events, warnings, debug };
+}
+
+test('Pi extension prefill and titles project into the host session', async t => {
+    const { session, events } = fixtureSession();
+    t.after(() => session.dispose());
+    const drafts = [];
+    session.promptInjector = async text => {
+        drafts.push(text);
+        return true;
+    };
+
+    session.onRecord({ type: 'extension_ui_request', id: 'prefill-1', method: 'set_editor_text', text: 'Use this plan' });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(drafts, ['Use this plan']);
+
+    session.onRecord({ type: 'extension_ui_request', id: 'title-1', method: 'setTitle', title: '  Extension title  ' });
+    assert.equal(session.title, 'Extension title');
+    assert.ok(events.some(event => event.type === 'session.title'
+        && event.title === 'Extension title' && event.source === 'auto'));
+});
+
+test('Pi interrupt clears queued work before aborting', async t => {
+    const { session, events } = fixtureSession();
+    t.after(() => session.dispose());
+    const calls = [];
+    let resolveTurn;
+    session.activeTurn = {
+        assistants: [],
+        userAnchors: [],
+        done: new Promise(resolve => { resolveTurn = resolve; }),
+        resolve: () => resolveTurn(),
+    };
+    session.status = 'running';
+    session.queued = [
+        { id: 'follow-1', text: 'Follow up', placement: 'followup' },
+        { id: 'steer-1', text: 'Steer', placement: 'steer' },
+    ];
+    session.rpc = {
+        async request(type) {
+            calls.push(type);
+            if (type === 'abort') session.finishTurn({ kind: 'aborted' });
+            return {};
+        },
+        async close() {},
+    };
+
+    const receipt = await session.cancel('interrupt');
+    assert.deepEqual(calls, ['clear_queue', 'abort']);
+    assert.deepEqual(receipt, { stillQueued: [], outcome: 'confirmed' });
+    assert.deepEqual(events.findLast(event => event.type === 'pending.changed').discarded, ['follow-1', 'steer-1']);
+});
+
+test('Failed Pi abort reports the queue state after clearing it', async t => {
+    const { session } = fixtureSession();
+    t.after(() => session.dispose());
+    session.activeTurn = {
+        assistants: [],
+        userAnchors: [],
+        done: Promise.resolve(),
+        resolve() {},
+    };
+    session.status = 'running';
+    session.queued = [
+        { id: 'follow-1', text: 'Follow up', placement: 'followup' },
+        { id: 'steer-1', text: 'Steer', placement: 'steer' },
+    ];
+    session.rpc = {
+        async request(type) {
+            if (type === 'clear_queue') return {};
+            if (type === 'abort') throw new Error('abort failed');
+            throw new Error(`unexpected request: ${type}`);
+        },
+        async close() {},
+    };
+
+    assert.deepEqual(await session.cancel('interrupt'), { stillQueued: [], outcome: 'unknown' });
+    assert.deepEqual(session.queued, []);
+    assert.equal(session.activeTurn.cancelling, false);
+});
+
+test('Pi user cancel leaves queued work with Pi', async t => {
+    const { session } = fixtureSession();
+    t.after(() => session.dispose());
+    const calls = [];
+    session.activeTurn = {
+        assistants: [],
+        userAnchors: [],
+        done: Promise.resolve(),
+        resolve() {},
+    };
+    session.status = 'running';
+    session.rpc = {
+        async request(type) {
+            calls.push(type);
+            if (type === 'abort') session.finishTurn({ kind: 'aborted' });
+            return {};
+        },
+        async close() {},
+    };
+
+    assert.deepEqual(await session.cancel('user'), { stillQueued: [], outcome: 'confirmed' });
+    assert.deepEqual(calls, ['abort']);
+});
+
+test('Pi runtime refresh updates image support with the selected model', async t => {
+    const { session, events } = fixtureSession();
+    t.after(() => session.dispose());
+    session.contextWindow = 8192;
+    session.rpc = {
+        async request(type) {
+            assert.equal(type, 'get_state');
+            return {
+                sessionId: session.sessionId,
+                sessionFile: '/tmp/fixture.jsonl',
+                model: { provider: 'fixture', id: 'vision', contextWindow: 16384, input: ['text', 'image'] },
+            };
+        },
+        async close() {},
+    };
+
+    await session.refreshRuntimeState();
+    assert.equal(session.providerId, 'fixture');
+    assert.equal(session.modelId, 'vision');
+    assert.equal(session.contextWindow, 16384);
+    assert.equal(session.acceptsImages, true);
+    assert.ok(events.some(event => event.type === 'context.capacity' && event.contextWindow === 16384));
+});
+
+test('Pi process exit discards queued work and closes pending interaction state', async () => {
+    const { session, events, warnings } = fixtureSession();
+    let resolved = false;
+    let resolveTurn;
+    const done = new Promise(resolve => {
+        resolveTurn = () => {
+            resolved = true;
+            resolve();
+        };
+    });
+    session.activeTurn = {
+        assistants: [],
+        userAnchors: [],
+        done,
+        resolve: () => resolveTurn(),
+    };
+    session.status = 'running';
+    session.queued = [
+        { id: 'follow-1', text: 'Follow up', placement: 'followup' },
+        { id: 'steer-1', text: 'Steer', placement: 'steer' },
+    ];
+    session.onRecord({
+        type: 'extension_ui_request',
+        id: 'pending-confirm',
+        method: 'confirm',
+        title: 'Approve?',
+        message: 'Approve before the process exits?',
+    });
+
+    session.handleRpcExit(new Error('Pi RPC exited (1): test failure'));
+
+    assert.equal(session.status, 'disposed');
+    assert.equal(session.activeTurn, undefined);
+    assert.deepEqual(session.queued, []);
+    assert.equal(session.sideQueries.signal.aborted, true);
+    assert.equal(session.interactions.hasPending(), false);
+    assert.equal(resolved, true);
+    assert.deepEqual(warnings, ['Pi RPC exited (1): test failure']);
+    assert.deepEqual(events.findLast(event => event.type === 'pending.changed').discarded, ['follow-1', 'steer-1']);
+    assert.ok(events.some(event => event.type === 'turn.end'
+        && event.reason.kind === 'error' && event.reason.message === 'Pi RPC exited (1): test failure'));
+    assert.ok(events.some(event => event.type === 'session.status' && event.status === 'disposed'));
+});
+
+test('Runtime refresh failure does not block turn completion', async () => {
+    const { session, events, debug } = fixtureSession();
+    let resolved = false;
+    session.activeTurn = {
+        assistants: [],
+        userAnchors: [],
+        done: Promise.resolve(),
+        resolve: () => { resolved = true; },
+    };
+    session.status = 'running';
+    session.rpc = {
+        async request(type) {
+            throw new Error(`${type} failed`);
+        },
+        async close() {},
+    };
+
+    await session.settleTurn(session.activeTurn, { kind: 'completed' });
+
+    assert.equal(session.activeTurn, undefined);
+    assert.equal(session.status, 'idle');
+    assert.equal(resolved, true);
+    assert.ok(events.some(event => event.type === 'turn.end' && event.reason.kind === 'completed'));
+    assert.ok(debug.includes('get_state failed'));
+});
