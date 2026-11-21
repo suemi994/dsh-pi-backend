@@ -1,3 +1,5 @@
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { open, readdir, readFile, realpath, rename, unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -175,6 +177,20 @@ export async function writePiFork(path, sessionId, cwd, branch, title) {
     return { backendId: 'pi', sessionId: id };
 }
 
+async function removePiSessionFile(path) {
+    const result = spawnSync('trash', path.startsWith('-') ? ['--', path] : [path], {
+        encoding: 'utf8', timeout: 10_000,
+    });
+    if (result.status === 0 || !existsSync(path)) return;
+    try {
+        await unlink(path);
+    } catch (error) {
+        const stderr = result.stderr?.trim().split(/\r?\n/)[0];
+        const hint = [result.error?.message, stderr].filter(Boolean).join(' · ');
+        throw new Error(`${error.message}${hint ? ` (trash: ${hint})` : ''}`, { cause: error });
+    }
+}
+
 export function createPiCliCatalog() {
     return {
         async list(scope, onPartial) { return (await scan(scope, onPartial)).map(row => row.summary); },
@@ -188,6 +204,14 @@ export function createPiCliCatalog() {
                 const text = messageText(entry.message);
                 return text ? [{ role, text: text.slice(0, 2000), at: Date.parse(entry.timestamp) || undefined }] : [];
             }).slice(-limit);
+        },
+        async delete(id, cwd) {
+            const row = await resolvePiSession(id, cwd);
+            if (!row) throw new Error(`Pi session not found: ${id}`);
+            const path = await realpath(row.path);
+            if (!path.endsWith('.jsonl')) throw new Error(`Not a Pi session file: ${path}`);
+            await requirePiSessionFile(path, id, cwd);
+            await removePiSessionFile(path);
         },
     };
 }

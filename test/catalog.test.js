@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { piCliBackend, piCliManifest } from '../backend.js';
-import { piBranch, writePiFork } from '../catalog.js';
+import { createPiCliCatalog, piBranch, writePiFork } from '../catalog.js';
 
 test('Pi registers its public backend identifier as pi', async () => {
     const plugin = JSON.parse(await readFile(new URL('../dsh-plugin.json', import.meta.url), 'utf8'));
@@ -47,4 +47,35 @@ test('Pi fork files preserve the selected branch as a new native session', async
     assert.equal(files.some(name => name.endsWith('.tmp')), false);
     if (process.platform !== 'win32') assert.equal((await stat(forkPath)).mode & 0o777, 0o600);
     assert.equal(dirname(forkPath), temp);
+});
+
+test('Pi catalog deletes only the requested native session', async t => {
+    const temp = await mkdtemp(join(tmpdir(), 'dsh-pi-delete-'));
+    const project = join(temp, 'project');
+    const oldSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR;
+    const oldPath = process.env.PATH;
+    t.after(async () => {
+        if (oldSessionDir === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR;
+        else process.env.PI_CODING_AGENT_SESSION_DIR = oldSessionDir;
+        process.env.PATH = oldPath;
+        await rm(temp, { recursive: true, force: true });
+    });
+    await writeFile(join(temp, 'keep.jsonl'), [
+        { type: 'session', id: 'keep', cwd: project, timestamp: '2026-01-01T00:00:00.000Z' },
+        { type: 'message', id: 'keep-user', parentId: null, message: { role: 'user', content: 'Keep me' } },
+    ].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+    const removePath = join(temp, 'remove.jsonl');
+    await writeFile(removePath, [
+        { type: 'session', id: 'remove', cwd: project, timestamp: '2026-01-02T00:00:00.000Z' },
+        { type: 'message', id: 'remove-user', parentId: null, message: { role: 'user', content: 'Delete me' } },
+    ].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+
+    process.env.PI_CODING_AGENT_SESSION_DIR = temp;
+    process.env.PATH = '';
+    const catalog = createPiCliCatalog();
+    await catalog.delete('remove', project);
+
+    await assert.rejects(access(removePath));
+    assert.equal((await catalog.info('keep', project)).id, 'keep');
+    await assert.rejects(catalog.delete('missing', project), /Pi session not found/);
 });
