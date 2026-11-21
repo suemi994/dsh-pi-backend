@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile as execFileCallback } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -249,6 +249,17 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
     assert.equal(await readFile(file, 'utf8'), seeded);
     const profile = process.env.PI_TUI_TEST_DSH_HOME;
     if (profile) {
+        let parentId = entries(seeded).at(-1).id;
+        const sidebarResults = [
+            ['f17e0001', 'todo', { todos: [{ text: 'Review Pi todo fixture', done: false }] }],
+            ['f17e0002', 'subagent', { results: [{ agent: 'reviewer', task: 'Pi child fixture', status: 'completed' }] }],
+        ];
+        for (const [id, toolName, details] of sidebarResults) {
+            const timestamp = Date.now();
+            await appendFile(file, JSON.stringify({ type: 'message', id, parentId, timestamp: new Date(timestamp).toISOString(),
+                message: { role: 'toolResult', toolCallId: id, toolName, content: [], isError: false, details, timestamp } }) + '\n');
+            parentId = id;
+        }
         const socket = `pi-roundtrip-${process.pid}`;
         const tmux = (...args) => execFile('tmux', ['-L', socket, ...args], { timeout: 5000 });
         t.after(() => tmux('kill-server').catch(() => {}));
@@ -257,7 +268,8 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
             let screen = '';
             while (Date.now() < deadline) {
                 screen = (await tmux('capture-pane', '-p', '-S', '-100')).stdout;
-                if (screen.includes(expected) === present) return;
+                const found = typeof expected === 'string' ? screen.includes(expected) : expected.test(screen);
+                if (found === present) return;
                 await new Promise(resolve => setTimeout(resolve, 100));
             }
             assert.fail(`TUI did not display ${expected}:\n${screen}`);
@@ -291,16 +303,24 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
         await tmux('send-keys', 'Enter');
         await waitForPane(turns[0][1]);
         const initialContext = await contextReadout();
-        await tmux('send-keys', '-l', '/panel');
+        await tmux('send-keys', '-l', '/panel info');
         await tmux('send-keys', 'Enter');
-        await waitForPane('Open panel');
-        for (let index = 0; index < 8; index += 1) await tmux('send-keys', 'Down');
-        await waitForPane('Pi Extensions');
-        await tmux('send-keys', 'Enter');
+        await waitForPane('Cache hit');
         await waitForPane('Pi fixture extension ready');
         await waitForPane('Pi widget fixture line');
         await tmux('send-keys', 'C-b');
-        await waitForPane('Pi widget fixture line', false);
+        await waitForPane('Esc chat', false);
+        await tmux('send-keys', '-l', '/panel todo');
+        await tmux('send-keys', 'Enter');
+        await waitForPane(/│.*Review Pi todo fixture/);
+        await tmux('send-keys', 'C-b');
+        await waitForPane('Esc chat', false);
+        await tmux('send-keys', '-l', '/panel agents');
+        await waitForPane('/panel agents');
+        await tmux('send-keys', 'Enter');
+        await waitForPane(/│.*Pi child fixture/);
+        await tmux('send-keys', 'C-b');
+        await waitForPane('Esc chat', false);
         for (const [index, [prompt, reply]] of turns.slice(1, 3).entries()) {
             const command = `/effort ${['high', 'low'][index]}`;
             await tmux('send-keys', '-l', command);
@@ -320,12 +340,31 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
         await waitForPane('Pi native');
         await tmux('send-keys', 'C-b');
         await waitForPane('Esc chat', false);
-        await tmux('send-keys', '-l', '/pi-');
-        await waitForPane('pi-suggest');
-        await tmux('send-keys', 'C-u');
-        await tmux('send-keys', '-l', '/pi-tree');
+        await tmux('send-keys', '-l', '/tree');
         await tmux('send-keys', 'Enter');
         await waitForPane('Pi session tree');
+        const seedAnchor = entries(seeded).find(entry => entry.message?.role === 'user').id;
+        await tmux('send-keys', '-l', `/tree ${seedAnchor}`);
+        await tmux('send-keys', 'Enter');
+        const deadlineForTree = Date.now() + 5000;
+        while (true) {
+            const screen = (await tmux('capture-pane', '-p', '-S', '-100')).stdout;
+            if (screen.split('Pi session tree').length === 3) break;
+            assert.ok(Date.now() < deadlineForTree, `TUI did not display the requested Pi branch:\n${screen}`);
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        await tmux('send-keys', '-l', `/fork ${seedAnchor}`);
+        await tmux('send-keys', 'Enter');
+        await waitForPane('Created a Pi branch.');
+        const newFiles = (await nativeSessionFiles(agentDir)).filter(path => path !== file);
+        assert.equal(newFiles.length, 1);
+        const forkContents = await readFile(newFiles[0], 'utf8');
+        assert.equal(entries(forkContents)[0].parentSession, file);
+        assert.deepEqual(messages(forkContents), transcript.slice(0, 1));
+        forkPaths.push(...newFiles);
+        await tmux('send-keys', '-l', '/suggest');
+        await tmux('send-keys', 'Enter');
+        await waitForPane('Side answer from Pi');
         await tmux('send-keys', '-l', '/recap');
         await tmux('send-keys', 'Enter');
         await waitForPane('Side recap from Pi');
@@ -393,7 +432,7 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
                 assert.ok(contextUsage.every(used => Number.isFinite(used)), JSON.stringify(contextUsage));
                 assert.notEqual(contextUsage[1], contextUsage[0], 'continued turns must refresh measured context usage');
                 const commands = await session.capabilities.commands.list();
-                assert.ok(commands.some(command => command.name === 'pi-tree'));
+                assert.ok(commands.some(command => command.name === 'tree'));
                 assert.ok(commands.some(command => command.name === 'plan'));
                 assert.ok(commands.some(command => command.name === 'goal'));
                 const currentUser = live.find(event => event.type === 'user.message' && event.source === 'user');
@@ -460,8 +499,8 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
                 const firstAnchor = replayed.find(event => event.source === 'user').anchor;
                 const rewindToFirst = await session.capabilities.rewind.rewind(firstAnchor, 'conversation');
                 assert.equal(rewindToFirst.kind, 'rewound', JSON.stringify(rewindToFirst));
-                await session.submit({ text: `/pi-fork ${firstAnchor}`, clientMessageId: 'tree-fork' }, 'turn');
-                const forkCommand = live.find(event => event.source === 'command-output' && event.label === '/pi-fork');
+                await session.submit({ text: `/fork ${firstAnchor}`, clientMessageId: 'tree-fork' }, 'turn');
+                const forkCommand = live.find(event => event.source === 'command-output' && event.label === '/fork');
                 const forkFromTree = { sessionId: forkCommand?.text.match(/\/resume ([a-f0-9-]+)/)?.[1] };
                 assert.ok(forkFromTree.sessionId);
                 for (const [ref, count] of [[forked, 6], [rewind.session, 4], [rewindToFirst.session, 0], [forkFromTree, 1]]) {

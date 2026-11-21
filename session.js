@@ -30,6 +30,21 @@ function isTuiOnlyCommand(command) {
 function configuredHiddenCommands() {
     return new Set((process.env.PI_HIDDEN_COMMANDS ?? '').split(',').map(name => name.trim()).filter(Boolean));
 }
+const localOverrides = [
+    { name: 'tree', description: 'Show Pi branches, or inspect one with /tree <entry-id>' },
+    { name: 'fork', description: 'Fork the current Pi branch, or use /fork <entry-id>' },
+];
+const localCommands = [
+    { name: 'steer', description: 'Send an instruction at the next Pi tool boundary' },
+    ...localOverrides,
+    { name: 'suggest', description: 'Suggest next prompts based on this conversation' },
+];
+const commandAliases = new Map(localCommands.slice(1).map(command => [
+    'pi-' + command.name, command.name,
+]));
+const reservedCommandNames = new Set([
+    ...localCommands.map(command => command.name), ...commandAliases.keys(),
+]);
 export class PiCliSession {
     backendId = 'pi';
     sessionId;
@@ -46,7 +61,8 @@ export class PiCliSession {
         },
         images: { limits: piImageLimits },
         sideQuery: { ask: (prompt, options) => askPiSideQuery(this, prompt, options) },
-        commands: { list: () => this.listCommands() },
+        commands: { localOverrides, list: () => this.listCommands() },
+        infoStatus: createPiExtensionState(),
         context: { usage: async () => {
             const { contextUsage } = await this.rpc.request('get_session_stats');
             if (contextUsage?.tokens == null) throw new Error('Pi has no current context measurement');
@@ -142,7 +158,6 @@ export class PiCliSession {
     entryCursor;
     liveAnchors = new Map();
     queued = [];
-    extensionState;
     interactions;
     childStates = new Map();
     acceptsImages;
@@ -160,7 +175,6 @@ export class PiCliSession {
         const sid = target.native?.summary.id ?? randomUUID();
         this.sessionId = sid;
         this.piSessionId = sid;
-        this.extensionState = createPiExtensionState(sid);
         this.interactions = new PiInteractions({
             emit: batch => this.emitLive(batch, { replay: false }),
             send: (record, callback) => this.rpc.send(record, callback),
@@ -183,7 +197,7 @@ export class PiCliSession {
     handleRpcExit(error) {
         const wasStarting = this.status === 'starting';
         this.sideQueries.abort();
-        this.extensionState.close();
+        this.capabilities.infoStatus.close();
         this.interactions.cancelAll({ respond: false });
         if (!wasStarting) this.setStatus('disposed');
         if (this.activeTurn) this.finishTurn({ kind: 'error', message: error.message });
@@ -193,11 +207,10 @@ export class PiCliSession {
         const { commands } = await this.rpc.request('get_commands');
         const hidden = configuredHiddenCommands();
         return [
-            { name: 'steer', description: 'Send an instruction at the next Pi tool boundary' },
-            { name: 'pi-tree', description: 'Show Pi branches, or inspect one with /pi-tree <entry-id>' },
-            { name: 'pi-fork', description: 'Fork a Pi tree node with /pi-fork <entry-id>' },
-            { name: 'pi-suggest', description: 'Suggest next prompts based on this conversation' },
-            ...commands.filter(command => !['steer', 'pi-tree', 'pi-fork', 'pi-suggest'].includes(command.name)
+            ...localCommands,
+            ...localCommands.filter(command => command.name !== 'steer')
+                .map(({ name, description }) => ({ name: 'pi-' + name, description, aliasFor: name })),
+            ...commands.filter(command => !reservedCommandNames.has(command.name)
                     && !hidden.has(command.name) && !isTuiOnlyCommand(command))
                 .map(({ name, description }) => ({ name, description })),
         ];
@@ -351,7 +364,7 @@ export class PiCliSession {
             this.emitLive(ready, { replay: false });
         } catch (error) {
             this.interactions.cancelAll({ respond: false });
-            this.extensionState.close();
+            this.capabilities.infoStatus.close();
             await this.rpc.close();
             throw error;
         }
@@ -603,24 +616,23 @@ export class PiCliSession {
             this.listeners.delete(listener);
         };
     }
-    async runLocalCommand(input, command, anchor) {
+    async runLocalCommand(input, command, anchor, label) {
         this.emitLive([ev({ type: 'pending.changed', items: [], claimed: [input.clientMessageId] })], { replay: false });
         let text;
         let level = 'info';
         const zh = this.host.locale?.() === 'zh';
         try {
-            if (anchor && (command === '/pi-suggest' || /\s/.test(anchor))) {
-                throw new Error(zh ? `参数无效：${command}` : `Invalid arguments for ${command}`);
+            if (anchor && (command === 'suggest' || /\s/.test(anchor))) {
+                throw new Error(zh ? `参数无效：${label}` : `Invalid arguments for ${label}`);
             }
-            if (command === '/pi-suggest') {
+            if (command === 'suggest') {
                 const locale = zh ? 'Chinese' : 'English';
                 const result = await this.capabilities.sideQuery.ask(
                     `Suggest 2 or 3 distinct next messages the user could send to advance this conversation. Write concise, copyable prompts in ${locale}.`);
                 if (result.answer === null && !result.error) return { accepted: true };
                 if (result.error) throw new Error(result.error);
                 text = result.answer;
-            } else if (command === '/pi-fork') {
-                if (!anchor) throw new Error(zh ? '用法：/pi-fork <节点 ID>' : 'Usage: /pi-fork <entry-id>');
+            } else if (command === 'fork') {
                 const forked = await this.forkSession(anchor);
                 text = zh ? `已派生 Pi 会话。使用 /resume ${forked.sessionId} 打开。`
                     : `Created a Pi branch. Open it with /resume ${forked.sessionId}.`;
@@ -651,7 +663,7 @@ export class PiCliSession {
             const event = level === 'error' ? { type: 'notice', level, text } : {
                 type: 'user.message', id: input.clientMessageId, anchor: '', seq: ++this.seq,
                 turn: this.turnNo, time: Date.now(), source: 'command-output', displayLive: true,
-                label: command, text, blocks: [{ type: 'text', text }],
+                label, text, blocks: [{ type: 'text', text }],
             };
             this.emitLive([event], { replay: false });
         }
@@ -681,9 +693,12 @@ export class PiCliSession {
         let images;
         try { if (input.images?.length) images = await piImageInputs(input.images); }
         catch (error) { return { accepted: false, reason: error.message }; }
-        const local = /^(\/pi-suggest|\/pi-tree|\/pi-fork)(?:\s+([\s\S]+))?$/.exec(text.trim());
-        if (local && this.status === 'idle' && !this.compacting) return this.runLocalCommand(input, local[1], local[2]);
-        if (local) return { accepted: false, reason: 'Pi session is not idle' };
+        const local = /^\/((?:pi-)?(?:suggest|tree|fork))(?:\s+([\s\S]+))?$/.exec(text.trim());
+        if (local) {
+            if (this.status !== 'idle' || this.compacting) return { accepted: false, reason: 'Pi session is not idle' };
+            const [, name, anchor] = local;
+            return this.runLocalCommand(input, commandAliases.get(name) ?? name, anchor, '/' + name);
+        }
         const commandName = /^\/([^\s]+)/.exec(text.trim())?.[1];
         if (commandName && TUI_ONLY_COMMAND.test(commandName)) {
             return { accepted: false, reason: `/${commandName} is only available in Pi's own TUI` };
@@ -721,7 +736,7 @@ export class PiCliSession {
             if (this.activeTurn === turn) {
                 if (error.code === 'PI_RPC_TIMEOUT') {
                     this.setStatus('disposed');
-                    this.extensionState.close();
+                    this.capabilities.infoStatus.close();
                     this.interactions.cancelAll({ respond: false });
                     await this.rpc.close();
                 }
@@ -747,7 +762,7 @@ export class PiCliSession {
             if (record.method === 'notify' && typeof record.message === 'string') {
                 const level = ['warning', 'error'].includes(record.notifyType) ? record.notifyType : 'notice';
                 this.emitLive([{ type: 'notice', level, text: record.message }], { replay: false });
-            } else if (!this.interactions.handle(record)) this.extensionState.update(record);
+            } else if (!this.interactions.handle(record)) this.capabilities.infoStatus.update(record);
             return;
         }
         if (record.type === 'thinking_level_changed') {
@@ -860,7 +875,7 @@ export class PiCliSession {
     async dispose() {
         this.status = 'disposed';
         this.sideQueries.abort();
-        this.extensionState.close();
+        this.capabilities.infoStatus.close();
         this.interactions.cancelAll();
         this.listeners.clear();
         if (this.activeTurn) this.activeTurn.cancelled = true;

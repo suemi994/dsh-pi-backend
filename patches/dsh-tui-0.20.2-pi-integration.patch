@@ -1,0 +1,207 @@
+diff --git a/lib/types/adapter/channel/ui-policy.js b/lib/types/adapter/channel/ui-policy.js
+index d990fa3..1ffe34d 100644
+--- a/lib/types/adapter/channel/ui-policy.js
++++ b/lib/types/adapter/channel/ui-policy.js
+@@ -151,6 +151,7 @@ export const CHANNEL_UI_PROPERTIES = [
+     'sessionId',
+     'agentBindingGeneration',
+     'sessionRef',
++    'infoStatus',
+     'backendCapabilities',
+     'costReport',
+     'rateLimit',
+diff --git a/lib/types/components/sidePanel/InfoPanel.js b/lib/types/components/sidePanel/InfoPanel.js
+index 5c763a5..ca43853 100644
+--- a/lib/types/components/sidePanel/InfoPanel.js
++++ b/lib/types/components/sidePanel/InfoPanel.js
+@@ -21,19 +21,12 @@ import { formatContextUsage } from '../../tuiDisplayPrefs.js';
+ import { modeDisplayName } from '../../sessionModes.js';
+ import { estimateSessionCostSnapshotCny, isDeepSeekOfficialProvider, isPeakHour } from '../../deepseekPricing.js';
+ import { formatCacheHitRate, formatCostReport } from '../../screens/StatusLine.js';
+-import { contextPressureStep, speedColor } from '../../screens/StatusMetrics.js';
++import { channelContextOccupancy, contextPressureStep, speedColor } from '../../screens/StatusMetrics.js';
+ import { displayWorkingDirectory, formatProject } from '../../sessions/format.js';
+ import { homeDir } from '../../utils/paths.js';
+ import { Divider } from '../design-system/Divider.js';
+ import { useSidePanelChannel } from './SidePanelRuntimeContext.js';
+ import { usePanelInput } from './usePanelInput.js';
+-/** 与状态栏同一口径的上下文已用量：最近一次请求的 input+cacheRead+cacheWrite。 */
+-function contextUsedOf(channel) {
+-    const usage = channel.lastUsage;
+-    if (usage === undefined)
+-        return undefined;
+-    return usage.input + usage.cacheRead + usage.cacheWrite;
+-}
+ /** 权限行取值：durable preset 身份优先，否则 sandbox·approval 原子拼合。 */
+ function approvalOf(mode) {
+     if (mode.permission !== undefined)
+@@ -67,7 +60,9 @@ export function InfoPanel({ width, height, focused, visible }) {
+     };
+     usePanelInput(panelKeyHandler, { active: focused && visible });
+     const usage = channel.lastUsage;
+-    const used = contextUsedOf(channel);
++    const occupancy = channelContextOccupancy(channel);
++    const used = occupancy?.usedTokens;
++    const contextWindow = occupancy?.contextWindow ?? channel.contextWindow;
+     const currentCwd = displayWorkingDirectory(channel);
+     const displayCwd = channel.displayCwd === channel.cwd
+         ? formatProject(currentCwd, homeDir())
+@@ -76,9 +71,9 @@ export function InfoPanel({ width, height, focused, visible }) {
+     const none = t('info-value-none');
+     const modeName = modeDisplayName(channel.mode);
+     const approval = approvalOf(channel.mode);
+-    const contextText = formatContextUsage(used, channel.contextWindow, true);
+-    const contextPct = used !== undefined && channel.contextWindow !== undefined && channel.contextWindow > 0
+-        ? (used / channel.contextWindow) * 100
++    const contextText = formatContextUsage(used, contextWindow, true);
++    const contextPct = used !== undefined && contextWindow !== undefined && contextWindow > 0
++        ? (used / contextWindow) * 100
+         : undefined;
+     const contextStep = contextPct !== undefined ? contextPressureStep(contextPct) : undefined;
+     const cacheText = formatCacheHitRate(usage) ?? none;
+@@ -126,5 +121,5 @@ export function InfoPanel({ width, height, focused, visible }) {
+     function Section({ title, children }) {
+         return (_jsxs(Box, { flexDirection: "column", marginTop: 1, width: "100%", children: [_jsx(Divider, { title: title }), _jsx(Box, { flexDirection: "column", marginTop: 0, width: "100%", children: children })] }));
+     }
+-    return (_jsx(Box, { flexDirection: "column", paddingLeft: 1, paddingRight: 1, width: width, flexShrink: 0, children: _jsxs(ScrollBox, { ref: scrollRef, flexDirection: "column", maxHeight: Math.max(3, height), flexGrow: 1, children: [_jsxs(Section, { title: t('info-section-session'), children: [_jsx(Row, { label: t('info-row-title'), value: channel.sessionTitle !== '' ? channel.sessionTitle : none }), _jsx(Row, { label: t('info-row-session-id'), value: channel.sessionId !== '' ? '#' + channel.sessionId.slice(0, 8) : none }), _jsx(Row, { label: t('info-row-agent-id'), value: channel.agentId !== '' ? '#' + channel.agentId.slice(0, 8) : none }), _jsx(Row, { label: t('info-row-cwd'), value: displayCwd !== '' ? displayCwd : none }), _jsx(Row, { label: t('info-row-branch'), value: channel.gitBranch !== undefined && channel.gitBranch !== '' ? channel.gitBranch : none })] }), _jsxs(Section, { title: t('info-section-model'), children: [_jsx(Row, { label: t('info-row-model'), value: channel.model !== '' ? channel.model : none }), _jsx(Row, { label: t('info-row-effort'), value: channel.reasoningEffort !== undefined && channel.reasoningEffort !== '' ? channel.reasoningEffort : none }), _jsx(Row, { label: t('info-row-mode'), value: modeName, valueColor: channel.mode.plan === true ? 'planMode' : modeNeedsExplicitMarker(channel.mode) ? 'warning' : undefined }), _jsx(Row, { label: t('info-row-approval'), value: approval !== undefined && approval !== '' ? approval : none, valueColor: modeNeedsExplicitMarker(channel.mode) ? 'warning' : undefined })] }), _jsxs(Section, { title: t('info-section-context'), children: [_jsx(Row, { label: t('info-row-context'), value: contextText ?? none, valueColor: contextStep }), _jsx(Row, { label: t('info-row-window'), value: channel.contextWindow !== undefined ? formatTokens(channel.contextWindow) : none }), _jsx(Row, { label: t('info-row-tokens'), value: formatTokens(channel.tokens.input) + '→' + formatTokens(channel.tokens.output) }), _jsx(Row, { label: t('info-row-cache'), value: cacheText }), _jsx(Row, { label: t('info-row-cost'), value: costText }), _jsx(Row, { label: t('info-row-tps'), value: tpsText })] }), _jsxs(Section, { title: t('info-section-runtime'), children: [_jsx(Row, { label: t('info-row-status'), value: String(channel.status) }), _jsx(Row, { label: t('info-row-activity'), value: channel.working ? channel.spinnerMode : none, valueColor: channel.working ? 'success' : undefined }), _jsx(Row, { label: t('info-row-jobs'), value: jobsText }), _jsx(Row, { label: t('info-row-subagents'), value: subagentsText })] })] }) }));
++    return (_jsx(Box, { flexDirection: "column", paddingLeft: 1, paddingRight: 1, width: width, flexShrink: 0, children: _jsxs(ScrollBox, { ref: scrollRef, flexDirection: "column", maxHeight: Math.max(3, height), flexGrow: 1, children: [channel.infoStatus?.map(([key, text]) => _jsx(Text, { children: text }, key)), _jsxs(Section, { title: t('info-section-session'), children: [_jsx(Row, { label: t('info-row-title'), value: channel.sessionTitle !== '' ? channel.sessionTitle : none }), _jsx(Row, { label: t('info-row-session-id'), value: channel.sessionId !== '' ? '#' + channel.sessionId.slice(0, 8) : none }), _jsx(Row, { label: t('info-row-agent-id'), value: channel.agentId !== '' ? '#' + channel.agentId.slice(0, 8) : none }), _jsx(Row, { label: t('info-row-cwd'), value: displayCwd !== '' ? displayCwd : none }), _jsx(Row, { label: t('info-row-branch'), value: channel.gitBranch !== undefined && channel.gitBranch !== '' ? channel.gitBranch : none })] }), _jsxs(Section, { title: t('info-section-model'), children: [_jsx(Row, { label: t('info-row-model'), value: channel.model !== '' ? channel.model : none }), _jsx(Row, { label: t('info-row-effort'), value: channel.reasoningEffort !== undefined && channel.reasoningEffort !== '' ? channel.reasoningEffort : none }), _jsx(Row, { label: t('info-row-mode'), value: modeName, valueColor: channel.mode.plan === true ? 'planMode' : modeNeedsExplicitMarker(channel.mode) ? 'warning' : undefined }), _jsx(Row, { label: t('info-row-approval'), value: approval !== undefined && approval !== '' ? approval : none, valueColor: modeNeedsExplicitMarker(channel.mode) ? 'warning' : undefined })] }), _jsxs(Section, { title: t('info-section-context'), children: [_jsx(Row, { label: t('info-row-context'), value: contextText ?? none, valueColor: contextStep }), _jsx(Row, { label: t('info-row-window'), value: channel.contextWindow !== undefined ? formatTokens(channel.contextWindow) : none }), _jsx(Row, { label: t('info-row-tokens'), value: formatTokens(channel.tokens.input) + '→' + formatTokens(channel.tokens.output) }), _jsx(Row, { label: t('info-row-cache'), value: cacheText }), _jsx(Row, { label: t('info-row-cost'), value: costText }), _jsx(Row, { label: t('info-row-tps'), value: tpsText })] }), _jsxs(Section, { title: t('info-section-runtime'), children: [_jsx(Row, { label: t('info-row-status'), value: String(channel.status) }), _jsx(Row, { label: t('info-row-activity'), value: channel.working ? channel.spinnerMode : none, valueColor: channel.working ? 'success' : undefined }), _jsx(Row, { label: t('info-row-jobs'), value: jobsText }), _jsx(Row, { label: t('info-row-subagents'), value: subagentsText })] })] }) }));
+ }
+diff --git a/lib/types/dsh-adapter/channel/core/compose.js b/lib/types/dsh-adapter/channel/core/compose.js
+index 2677f13..94c6997 100644
+--- a/lib/types/dsh-adapter/channel/core/compose.js
++++ b/lib/types/dsh-adapter/channel/core/compose.js
+@@ -420,6 +420,9 @@ export function createCoreChannel(ctx, initialSession, options, owner) {
+             const ref = binding.session.ref;
+             return { backendId: ref.backendId, sessionId: ref.sessionId };
+         },
++        get infoStatus() {
++            return binding.session.capabilities.infoStatus?.getSnapshot();
++        },
+         get liveTurnEnds() { return feed.liveTurnEnds(); },
+         costReport: undefined,
+         rateLimit: undefined,
+@@ -728,6 +731,7 @@ export function createCoreChannel(ctx, initialSession, options, owner) {
+         }));
+     }
+     const controls = createSessionControls({ state: () => state, backendLabel: () => state.backendCapabilities.backendLabel });
++    owner.own(controls.stopInfoStatus);
+     const feed = createBindingFeed(ctx, {
+         owner,
+         binding,
+diff --git a/lib/types/dsh-adapter/channel/core/session-controls.js b/lib/types/dsh-adapter/channel/core/session-controls.js
+index ba848cc..36d8feb 100644
+--- a/lib/types/dsh-adapter/channel/core/session-controls.js
++++ b/lib/types/dsh-adapter/channel/core/session-controls.js
+@@ -24,23 +24,41 @@ const debugFailure = (what) => (error) => {
+     logForDebugging(`channel: ${what} failed (${error instanceof Error ? error.message : String(error)})`);
+ };
+ export function createSessionControls(deps) {
+-    /** The backend's own commands, merged after the local ones. */
+     let backendCommands = [];
++    let localOverrides = [];
++    let unsubscribeInfoStatus;
++    const stopInfoStatus = () => {
++        unsubscribeInfoStatus?.();
++        unsubscribeInfoStatus = undefined;
++    };
+     /** `/mcp` is synchronous: it reads the last report (refreshed per turn). */
+     let mcpLines;
+     /** The servers of that report (`/mcp reconnect|toggle` completion). */
+     let mcpNames;
++    const backendEntry = ({ name, description }) => ({
++        name,
++        description: description ?? '',
++        tag: deps.backendLabel(),
++        skill: true,
++        origin: 'backend',
++    });
+     const refreshCommandList = () => {
+         const state = deps.state();
+-        // Local names win, served here or not: a typed `/init` is the local
+-        // command (or its explicit unavailability), never the backend's. A
+-        // served `/goal` (the typed capability) wins over a same-named backend
+-        // command the same way. Compare names case-insensitively, as completion does.
+         const served = localCommandsFor(state.backendCapabilities.commands);
++        if (localOverrides.length === 0 && backendCommands.length === 0) {
++            state.commandList = served;
++            return;
++        }
++        const overrides = new Map(localOverrides.map(command => [command.name, command]));
+         const local = new Set([...LOCAL_COMMANDS.map(command => command.name), ...(served.includes(BACKEND_GOAL_COMMAND) ? [BACKEND_GOAL_COMMAND.name] : [])]);
+-        state.commandList = backendCommands.length === 0
+-            ? served
+-            : [...served, ...backendCommands.filter(command => !local.has(command.name.toLowerCase()))];
++        const merged = served.map(command => overrides.get(command.name) ?? command);
++        const servedNames = new Set(served.map(command => command.name));
++        merged.push(...localOverrides.filter(command => !servedNames.has(command.name)));
++        const available = backendCommands.filter(command => !local.has(command.name.toLowerCase())
++            && !overrides.has(command.name.toLowerCase()));
++        const availableNames = new Set([...overrides.keys(), ...available.map(command => command.name)]);
++        merged.push(...available.filter(command => !availableNames.has(command.aliasFor)).map(backendEntry));
++        state.commandList = merged;
+     };
+     const loadBackendCommands = (session, current) => {
+         const commands = session.capabilities.commands;
+@@ -49,13 +67,7 @@ export function createSessionControls(deps) {
+         void commands.list().then(list => {
+             if (!current())
+                 return;
+-            backendCommands = list.map(command => ({
+-                name: command.name,
+-                description: command.description ?? '',
+-                tag: deps.backendLabel(),
+-                skill: true,
+-                origin: 'backend',
+-            }));
++            backendCommands = list;
+             refreshCommandList();
+             deps.state().emit();
+         }).catch(debugFailure('backend commands'));
+@@ -124,7 +136,16 @@ export function createSessionControls(deps) {
+     };
+     /** A freshly bound session: read what it already knows. */
+     const seed = (session, current) => {
++        stopInfoStatus();
++        unsubscribeInfoStatus = session.capabilities.infoStatus?.subscribe(() => {
++            if (current())
++                deps.state().emit();
++        });
+         backendCommands = [];
++        localOverrides = (session.capabilities.commands?.localOverrides ?? []).map(command => ({
++            ...backendEntry(command),
++            backendOverride: true,
++        }));
+         mcpLines = undefined;
+         mcpNames = undefined;
+         const modes = session.capabilities.modes;
+@@ -196,13 +217,16 @@ export function createSessionControls(deps) {
+     };
+     /** A session switch: forget the replaced session's commands and reports. */
+     const reset = () => {
++        stopInfoStatus();
+         backendCommands = [];
++        localOverrides = [];
+         mcpLines = undefined;
+         mcpNames = undefined;
+         refreshCommandList();
+     };
+     return {
+         seed,
++        stopInfoStatus,
+         observe,
+         reset,
+         refreshCommandList,
+diff --git a/lib/types/screens/Chat.js b/lib/types/screens/Chat.js
+index 805ed9a..1a647f9 100644
+--- a/lib/types/screens/Chat.js
++++ b/lib/types/screens/Chat.js
+@@ -2766,6 +2766,9 @@ export function Chat({ channel, questionStore, approvalStore, extensionDialogs,
+     const runCommand = (name, rawInput = '', images = []) => {
+         if (refusedAtStartup(name))
+             return true;
++        // The composer submits backend overrides through the ordinary session route.
++        if (channel.commandList.some(command => command.name === name && command.backendOverride))
++            return false;
+         switch (name) {
+             case 'activity': {
+                 // Ported from the pi working-activity extension: bare `/activity`

@@ -1,54 +1,22 @@
 import { messageText } from './catalog.js';
 
-const sessions = new Map();
-const listeners = new Set();
 const empty = [];
-const publish = () => { for (const listener of listeners) listener(); };
-
-function section(el, ui, key, title, rows, emptyText) {
-    return [
-        el(ui.Text, { key: `${key}:title`, bold: true, color: 'accent' }, title),
-        ...(rows.length ? rows : [
-            el(ui.Text, { key: `${key}:empty`, dimColor: true }, emptyText),
-        ]),
-    ];
-}
-
-export function piExtensionPanel({ React, ui, host, height }) {
-    const { sessionId, lang, todos, subagents } = host.snapshot();
-    const extensionRows = React.useSyncExternalStore(listener => {
-        listeners.add(listener);
-        return () => listeners.delete(listener);
-    }, () => sessions.get(sessionId)?.rows ?? empty);
-    const el = React.createElement;
-    const zh = lang === 'zh';
-    const todoRows = todos.map((todo, index) => el(ui.Text, { key: `todo:${index}` },
-        `${todo.status === 'completed' ? '✓' : todo.status === 'in_progress' ? '◐' : '○'} ${clean(todo.content)}`));
-    const subagentRows = subagents.map((subagent, index) => {
-        const icon = subagent.status === 'completed' ? '✓'
-            : subagent.status === 'failed' ? '×'
-                : ['starting', 'running'].includes(subagent.status) ? '●' : '?';
-        return el(ui.Text, { key: `subagent:${subagent.agentId || index}` },
-            `${icon} ${clean(subagent.description || subagent.agentId || '')} · ${clean(subagent.status || 'unknown')}`);
-    });
-    return el(ui.ScrollBox, { flexDirection: 'column', maxHeight: height, paddingX: 1 },
-        ...section(el, ui, 'extensions', zh ? 'Pi 扩展' : 'Pi extensions',
-            extensionRows.map(([key, text]) => el(ui.Text, { key }, text)),
-            zh ? '暂无 Pi 扩展状态' : 'No Pi extension status'),
-        ...section(el, ui, 'todos', zh ? 'Todo' : 'Todo', todoRows,
-            zh ? '暂无 Todo' : 'No todos'),
-        ...section(el, ui, 'subagents', zh ? '子代理' : 'Subagents', subagentRows,
-            zh ? '暂无子代理' : 'No subagents'));
-}
 
 function clean(value) {
     return value.replace(/[\u0000-\u001f\u007f-\u009f]/gu, ' ').slice(0, 500);
 }
 
-export function createPiExtensionState(sessionId) {
+export function createPiExtensionState() {
     const values = new Map();
-    const state = { rows: empty };
+    const listeners = new Set();
+    let rows = empty;
+    const publish = () => { for (const listener of listeners) listener(); };
     return {
+        getSnapshot: () => rows,
+        subscribe(listener) {
+            listeners.add(listener);
+            return () => listeners.delete(listener);
+        },
         update(record) {
             const status = record.method === 'setStatus';
             if (!status && record.method !== 'setWidget') return;
@@ -60,15 +28,16 @@ export function createPiExtensionState(sessionId) {
                 .slice(0, 30).map(clean).join('\n');
             if (text) {
                 if (values.size >= 32 && !values.has(id)) return;
+                if (values.get(id) === text) return;
                 values.set(id, text);
-            } else values.delete(id);
-            state.rows = [...values];
-            sessions.set(sessionId, state);
+            } else if (!values.delete(id)) return;
+            rows = [...values];
             publish();
         },
         close() {
-            if (sessions.get(sessionId) !== state) return;
-            sessions.delete(sessionId);
+            if (!values.size) return;
+            values.clear();
+            rows = empty;
             publish();
         },
     };

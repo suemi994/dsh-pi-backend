@@ -1,5 +1,1 @@
-- insert:
-    - id: pi-panel
-      name: "@suemi/dsh-pi-backend"
-      inject:
-        - tuiPanels
+[]

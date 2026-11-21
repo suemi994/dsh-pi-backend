@@ -58,9 +58,11 @@ test('TUI-only Pi extension commands stay out of the host command menu', async t
         async close() {},
     };
 
-    const commands = await session.capabilities.commands.list();
+    const { localOverrides, list } = session.capabilities.commands;
+    assert.deepEqual(localOverrides.map(command => command.name), ['tree', 'fork']);
+    const commands = await list();
     assert.deepEqual(commands.map(command => command.name), [
-        'steer', 'pi-tree', 'pi-fork', 'pi-suggest', 'plan', 'council', 'skill:pi-subagents',
+        'steer', 'tree', 'fork', 'suggest', 'pi-tree', 'pi-fork', 'pi-suggest', 'plan', 'council', 'skill:pi-subagents',
     ]);
 });
 
@@ -87,7 +89,7 @@ test('Hidden Pi commands can be added by name', async t => {
     };
 
     const commands = await session.capabilities.commands.list();
-    assert.deepEqual(commands.map(command => command.name), ['steer', 'pi-tree', 'pi-fork', 'pi-suggest', 'plan']);
+    assert.deepEqual(commands.map(command => command.name), ['steer', 'tree', 'fork', 'suggest', 'pi-tree', 'pi-fork', 'pi-suggest', 'plan']);
 });
 
 test('Typing a TUI-only command explains why it cannot run', async t => {

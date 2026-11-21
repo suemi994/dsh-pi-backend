@@ -19,7 +19,7 @@ dsh-tui --backend pi
 
 支持 PNG/JPEG 图片输入，单条消息最多 8 张、单图最多 8 MiB、合计最多 24 MiB，宽高均不得超过 2048 像素。历史回放会恢复 Pi 原生会话中的图片。图片进入 Pi 前会在宿主侧校验，所选模型不支持图片时会明确拒绝。
 
-回合运行期间，Enter 将输入作为 steer 注入 Pi 的下一个工具边界，Tab 则排队为 follow-up，当前回合结束后继续执行。也可显式输入 `/steer <补充指令>`。Pi 的 `setStatus`/`setWidget` 扩展状态、Todo 和子代理状态会汇总在 **Pi Extensions** 侧栏面板中，同时继续投影到宿主内置的 Todo/Agents 面板。
+回合运行期间，Enter 将输入作为 steer 注入 Pi 的下一个工具边界，Tab 则排队为 follow-up，当前回合结束后继续执行。也可显式输入 `/steer <补充指令>`。Pi 的 Todo 和子代理状态分别显示在内置的 Todo 和 Agents 侧栏。应用宿主补丁后，`setStatus` 和 `setWidget` 文本会显示在信息面板。
 
 Pi 扩展的 `confirm` 弹窗会显示为权限批准，可选择允许一次或拒绝。`select`、`input`、`editor` 会显示为 Question 交互，回答会按 Pi 的 RPC 协议送回扩展。Pi 的确认协议没有持久授权范围，因此不会显示“始终允许”。`setEditorText` 会追加到当前 dsh-tui 输入框，扩展设置的标题会同步到会话标题。Pi 的 RPC 模式本身不提供 `setWorkingMessage`、自定义 UI 和自定义编辑器组件，这些调用会继续按 Pi 的无操作行为处理。
 
@@ -28,10 +28,14 @@ Pi 扩展的 `confirm` 弹窗会显示为权限批准，可选择允许一次或
 `/compact` 调用 Pi 自己的压缩：摘要和压缩检查点写进原生会话文件，之后用 Pi CLI 打开同一条会话也会看到同样的压缩结果。Pi 自动压缩时界面同样显示压缩进度。回合运行中执行 `/compact` 会被拒绝，等回合结束再执行。
 
 - `/btw <问题>` 在侧栏或浮层回答旁路问题，`/recap` 生成摘要和可应用的标题。两者使用当前 Pi 模型和近期对话片段，在独立的无工具临时进程中运行，主会话和原生 JSONL 不受影响。只通过 Pi 扩展注册的模型可能无法在该进程中加载。
-- `/pi-suggest` 给出几条可复制的后续提示词。输入 `/` 也会显示 Pi 暴露的扩展命令、提示模板和技能。已安装的 Plan、Goal 等扩展注册的命令（如 `/plan`、`/goal`）会原样交给 Pi 扩展执行，本插件不复制其状态机。与 dsh-tui 内置本地命令重名时，宿主命令仍优先。
+- `/suggest` 给出几条可复制的后续提示词。输入 `/` 也会显示 Pi 暴露的扩展命令、提示模板和技能。已安装的 Plan、Goal 等扩展注册的命令（如 `/plan`、`/goal`）会原样交给 Pi 扩展执行，本插件不复制其状态机。
 - Pi TUI 专属扩展命令（如 `sidebar`、`open-tui`、`tool-display`）在 RPC 模式下没有可用的界面，因此不会出现在 `/` 菜单；显式输入时会收到只能回到 Pi TUI 使用的提示。其他 TUI 插件的命令可用 `PI_HIDDEN_COMMANDS` 按名称追加隐藏，多个名称以逗号分隔。
-- `/pi-tree` 显示最近的 Pi 会话树节点、父节点 ID 和当前分支标记。用 `/pi-tree <节点 ID>` 查看该节点的来路，或用 `/pi-fork <节点 ID>` 从该节点派生会话。Pi 使用 `/fork` 派生当前分支，通过 `/rewind` 选择消息并在新分支上继续。回退只影响对话，保留原会话和工作区文件。
+- 应用宿主补丁后，Pi 内核下的 `/tree` 显示原生会话树，`/tree <节点 ID>` 查看该节点的来路。`/fork` 派生当前分支，`/fork <节点 ID>` 从指定节点派生。`/rewind` 可以选择消息并在新分支上继续。原会话和工作区文件会保留。旧的 `/pi-tree`、`/pi-fork`、`/pi-suggest` 仍可手动输入。
 - `/rename` 将标题写回 Pi 会话。`/context` 显示 Pi 最近一次有效的上下文测量，首次回复前及压缩后重新测量前可能没有数据。
+
+## 宿主补丁
+
+[dsh-tui 0.20.2 宿主补丁](patches/dsh-tui-0.20.2-pi-integration.patch) 通过 profile 的 pnpm `patchedDependencies` 应用到 `@deepseek-harness-tui/dsh-tui`。profile 已有同一个包的补丁时，把这些改动合入原补丁后重新安装。未应用补丁的宿主仍可用 `/pi-tree` 和 `/pi-fork` 访问 Pi 会话树及节点派生。
 
 ## 验证
 
