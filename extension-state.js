@@ -1,9 +1,14 @@
 import { messageText } from './catalog.js';
+import { stripVTControlCharacters } from 'node:util';
 
 const empty = [];
 
+export function piPlainText(value) {
+    return stripVTControlCharacters(value).replace(/[\u0000-\u001f\u007f-\u009f]/gu, ' ');
+}
+
 function clean(value) {
-    return value.replace(/[\u0000-\u001f\u007f-\u009f]/gu, ' ').slice(0, 500);
+    return piPlainText(value).slice(0, 500);
 }
 
 export function createPiExtensionState() {

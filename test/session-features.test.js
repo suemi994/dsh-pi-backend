@@ -92,6 +92,23 @@ test('Hidden Pi commands can be added by name', async t => {
     assert.deepEqual(commands.map(command => command.name), ['steer', 'tree', 'fork', 'suggest', 'pi-tree', 'pi-fork', 'pi-suggest', 'plan']);
 });
 
+test('Checkpoint restore only appears when a Pi extension provides it', async t => {
+    const { session } = fixtureSession();
+    t.after(() => session.dispose());
+    const commands = [
+        { name: 'checkpoint', source: 'extension' },
+        { name: 'rewind', source: 'prompt' },
+    ];
+    session.rpc = { async request() { return { commands }; }, async close() {} };
+    const listRestore = async () => (await session.capabilities.commands.list())
+        .filter(command => ['rewind', 'restore'].includes(command.name));
+    assert.deepEqual(await listRestore(), []);
+    commands.push({ name: 'rewind', source: 'extension', description: 'Previous checkpoint' });
+    assert.deepEqual(await listRestore(), [{ name: 'restore', description: 'Previous checkpoint' }]);
+    commands.push({ name: 'restore', source: 'extension', description: 'Restore checkpoint' });
+    assert.deepEqual(await listRestore(), [{ name: 'restore', description: 'Restore checkpoint' }]);
+});
+
 test('Typing a TUI-only command explains why it cannot run', async t => {
     const { session } = fixtureSession();
     t.after(() => session.dispose());

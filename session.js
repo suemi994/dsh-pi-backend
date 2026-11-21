@@ -1,16 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { readPiBranch, messageText, piBranch, requirePiSessionFile, writePiFork } from './catalog.js';
 import { dirname, join } from 'node:path';
 import { modelSpec } from './catalog-models.js';
 import { PiRpc } from './rpc.js';
 import { askPiSideQuery } from './side-query.js';
-import { createPiExtensionState, piTodos, piSubagents } from './extension-state.js';
+import { createPiExtensionState, piPlainText, piTodos, piSubagents } from './extension-state.js';
 import { piImageInputs, piImageLimits, piTranscriptImages } from './images.js';
 import { PiInteractions } from './interactions.js';
 import { piToolCall, piToolResult } from './presentation.js';
 import { createPiPromptInjector } from './prompt-injection.js';
+import { bridgeCommand } from './rpc-extension.js';
 function ev(e) {
     return e;
 }
@@ -31,7 +33,7 @@ function configuredHiddenCommands() {
     return new Set((process.env.PI_HIDDEN_COMMANDS ?? '').split(',').map(name => name.trim()).filter(Boolean));
 }
 const localOverrides = [
-    { name: 'tree', description: 'Show Pi branches, or inspect one with /tree <entry-id>' },
+    { name: 'tree', description: 'Navigate or fork Pi branches, or inspect one with /tree <entry-id>' },
     { name: 'fork', description: 'Fork the current Pi branch, or use /fork <entry-id>' },
 ];
 const localCommands = [
@@ -43,7 +45,7 @@ const commandAliases = new Map(localCommands.slice(1).map(command => [
     'pi-' + command.name, command.name,
 ]));
 const reservedCommandNames = new Set([
-    ...localCommands.map(command => command.name), ...commandAliases.keys(),
+    ...localCommands.map(command => command.name), ...commandAliases.keys(), bridgeCommand, 'restore', 'rewind',
 ]);
 export class PiCliSession {
     backendId = 'pi';
@@ -164,6 +166,7 @@ export class PiCliSession {
     acceptsImages;
     streamed = new Set();
     compacting = false;
+    branchCommandRunning = false;
     promptInjector;
     toolSteps = new Map();
     toolOutput = new Map();
@@ -204,24 +207,34 @@ export class PiCliSession {
         if (this.activeTurn) this.finishTurn({ kind: 'error', message: error.message });
         if (!wasStarting) this.host.warn?.(error.message);
     }
-    async listCommands() {
+    async extensionCommands() {
         const { commands } = await this.rpc.request('get_commands');
         const hidden = configuredHiddenCommands();
+        return commands.filter(command => !hidden.has(command.name) && !isTuiOnlyCommand(command));
+    }
+    restoreCommand(commands) {
+        return ['restore', 'rewind'].map(name => commands.find(command => command.name === name
+            && command.source === 'extension')).find(Boolean);
+    }
+    async listCommands() {
+        const commands = await this.extensionCommands();
+        const restore = this.restoreCommand(commands);
         return [
             ...localCommands,
             ...localCommands.filter(command => command.name !== 'steer')
                 .map(({ name, description }) => ({ name: 'pi-' + name, description, aliasFor: name })),
-            ...commands.filter(command => !reservedCommandNames.has(command.name)
-                    && !hidden.has(command.name) && !isTuiOnlyCommand(command))
+            ...(restore ? [{ name: 'restore', description: restore.description ?? 'Restore a Pi checkpoint' }] : []),
+            ...commands.filter(command => !reservedCommandNames.has(command.name))
                 .map(({ name, description }) => ({ name, description })),
         ];
     }
-    async forkSession(anchor, title, rewind = false) {
-        if (this.status !== 'idle' || this.compacting) throw new Error('Wait for Pi to finish before creating a branch');
+    async forkSession(anchor, title, rewind = false, fromTree = false) {
+        const expectedStatus = fromTree ? 'running' : 'idle';
+        if (this.status !== expectedStatus || this.compacting) throw new Error('Wait for Pi to finish before creating a branch');
         const path = this.sessionFile;
         if (!path) throw new Error('Pi has no persisted session to fork');
         const { entries, leafId } = await this.rpc.request('get_entries');
-        if (this.status !== 'idle' || this.compacting) throw new Error('Pi started another operation');
+        if (this.status !== expectedStatus || this.compacting) throw new Error('Pi started another operation');
         const id = anchor === undefined ? leafId : this.liveAnchors.get(anchor) ?? anchor;
         const branch = piBranch(entries, id);
         if (!id || branch.at(-1)?.id !== id) throw new Error('Pi branch entry is unavailable');
@@ -333,7 +346,7 @@ export class PiCliSession {
             }
             for (const entry of branch) this.replayEntry(entry);
         }
-        const args = ['--mode', 'rpc'];
+        const args = ['--mode', 'rpc', '--extension', fileURLToPath(new URL('./rpc-extension.js', import.meta.url))];
         if (this.sessionFile) args.push('--session', this.sessionFile);
         else args.push('--session-id', this.piSessionId);
         if (this.modelOverride) args.push('--model', this.modelOverride);
@@ -583,7 +596,7 @@ export class PiCliSession {
     }
     updateInteractionStatus(waiting) {
         if (this.status === 'starting' || this.status === 'disposed') return;
-        const status = waiting ? 'requires-action' : this.activeTurn ? 'running' : 'idle';
+        const status = waiting ? 'requires-action' : this.activeTurn || this.branchCommandRunning ? 'running' : 'idle';
         if (status !== this.status) this.setStatus(status);
     }
     emitLive(batch, meta) {
@@ -627,16 +640,79 @@ export class PiCliSession {
             || /[\p{Cc}\u2028\u2029]/u.test(text)) return;
         return text;
     }
+    async refreshBranch(previousLeaf) {
+        const { entries, leafId } = await this.rpc.request('get_entries');
+        if (previousLeaf === leafId || this.status === 'disposed') return false;
+        await this.refreshRuntimeState(undefined, { emitCapacity: false });
+        if (this.status === 'disposed') return false;
+        this.emitLive([{ type: 'session.reset', trigger: 'pi-branch' }], { replay: false });
+        this.historyEvents.length = 0;
+        this.turnNo = 0;
+        this.stepNo = 0;
+        this.liveAnchors.clear();
+        this.toolSteps.clear();
+        this.childStates.clear();
+        this.entryCursor = entries.at(-1)?.id;
+        for (const entry of piBranch(entries, leafId)) this.replayEntry(entry);
+        if (this.turnNo) this.pushHistory([{ type: 'turn.end', turn: this.turnNo,
+            reason: { kind: 'completed' }, time: Date.now() }]);
+        const history = [...this.historyEvents];
+        for (const listener of this.listeners) listener(history, { replay: true });
+        this.emitLive([{ type: 'session.ready', sessionId: this.sessionId, cwd: this.cwd,
+            model: this.modelId, provider: this.providerId, contextWindow: this.contextWindow,
+            title: this.title, effort: this.thinkingLevel }], { replay: false });
+        await this.refreshStats();
+        return true;
+    }
+    async runRestore(args) {
+        const command = this.restoreCommand(await this.extensionCommands());
+        if (!command) throw new Error(this.host.locale?.() === 'zh'
+            ? '当前 Pi 扩展未提供检查点恢复命令' : 'No Pi extension provides checkpoint restore');
+        const { leafId } = await this.rpc.request('get_entries');
+        const bridge = '/' + bridgeCommand;
+        await this.rpc.request('prompt', { message: bridge + ' prepare-restore' });
+        try {
+            await this.rpc.request('prompt', { message: '/' + command.name + (args ? ' ' + args : '') }, null);
+        } finally {
+            await this.rpc.request('prompt', { message: bridge + ' finish-restore' });
+            await this.refreshBranch(leafId);
+        }
+    }
+    async pickTreeEntry(rows, title, zh, leafId) {
+        const selected = await this.interactions.select(randomUUID(), title, rows.map(row => row.label));
+        const entry = rows.find(row => row.label === selected)?.entry;
+        if (!entry || this.status === 'disposed') return;
+        const rewind = zh ? '回退到此处并编辑消息' : 'Rewind here and edit message';
+        const fork = zh ? '从此处派生会话' : 'Fork a session from here';
+        const action = await this.interactions.select(randomUUID(), zh ? 'Pi 分支操作' : 'Pi branch action', [rewind, fork]);
+        if (this.status === 'disposed') return;
+        if (action === fork) return this.forkNotice(await this.forkSession(entry.id, undefined, false, true), zh);
+        if (action === rewind) {
+            await this.rpc.request('prompt', { message: `/${bridgeCommand} navigate ${entry.id}` }, null);
+            if (await this.refreshBranch(leafId)) await this.promptInjector(messageText(entry.message));
+        }
+    }
+    forkNotice(forked, zh) {
+        return zh ? `已派生 Pi 会话。使用 /resume ${forked.sessionId} 打开。`
+            : `Created a Pi branch. Open it with /resume ${forked.sessionId}.`;
+    }
     async runLocalCommand(input, command, anchor, label) {
         this.emitLive([ev({ type: 'pending.changed', items: [], claimed: [input.clientMessageId] })], { replay: false });
         let text;
         let level = 'info';
         const zh = this.host.locale?.() === 'zh';
+        const interactive = (command === 'tree' && !anchor) || command === 'restore';
+        if (interactive) {
+            this.branchCommandRunning = true;
+            this.updateInteractionStatus(false);
+        }
         try {
-            if (anchor && (command === 'suggest' || /\s/.test(anchor))) {
+            if (command !== 'restore' && anchor && (command === 'suggest' || /\s/.test(anchor))) {
                 throw new Error(zh ? `参数无效：${label}` : `Invalid arguments for ${label}`);
             }
-            if (command === 'suggest') {
+            if (command === 'restore') {
+                await this.runRestore(anchor);
+            } else if (command === 'suggest') {
                 const locale = zh ? 'Chinese' : 'English';
                 const result = await this.capabilities.sideQuery.ask(
                     `Suggest 2 or 3 distinct next messages the user could send to advance this conversation. Write concise, copyable prompts in ${locale}.`);
@@ -644,31 +720,35 @@ export class PiCliSession {
                 if (result.error) throw new Error(result.error);
                 text = result.answer;
             } else if (command === 'fork') {
-                const forked = await this.forkSession(anchor);
-                text = zh ? `已派生 Pi 会话。使用 /resume ${forked.sessionId} 打开。`
-                    : `Created a Pi branch. Open it with /resume ${forked.sessionId}.`;
+                text = this.forkNotice(await this.forkSession(anchor), zh);
             } else {
                 const { entries, leafId } = await this.rpc.request('get_entries');
                 const active = new Set(piBranch(entries, leafId).map(entry => entry.id));
                 const branch = anchor ? piBranch(entries, anchor) : entries;
                 if (anchor && branch.at(-1)?.id !== anchor) throw new Error(zh ? '找不到该 Pi 节点' : 'Pi tree entry was not found');
                 const nearestUser = new Map();
-                const lines = [];
+                const rows = [];
                 for (const entry of branch) {
                     const parent = nearestUser.get(entry.parentId);
                     const isUser = entry.message?.role === 'user';
                     nearestUser.set(entry.id, isUser ? entry.id : parent);
                     if (!isUser) continue;
-                    const preview = messageText(entry.message).replace(/\s+/g, ' ').slice(0, 65);
-                    lines.push(`${active.has(entry.id) ? '●' : '○'} ${entry.id} ← ${parent ?? '∅'}  ${preview}`);
+                    const preview = piPlainText(messageText(entry.message)).replace(/\s+/g, ' ').slice(0, 65);
+                    rows.push({ entry, label: `${active.has(entry.id) ? '●' : '○'} ${entry.id} ← ${parent ?? '∅'}  ${preview}` });
                 }
                 const title = zh ? 'Pi 会话树（● 当前分支，○ 其他分支）' : 'Pi session tree (● active branch, ○ other branch)';
-                const trimmed = lines.length > 100 ? [zh ? '… 较早的节点已省略' : '… earlier entries omitted'] : [];
-                text = [title, ...trimmed, ...lines.slice(-100)].join('\n');
+                if (!rows.length) text = zh ? 'Pi 会话树暂无消息' : 'The Pi session tree has no messages yet.';
+                else if (!anchor) text = await this.pickTreeEntry(rows, title, zh, leafId);
+                else text = [title, ...rows.map(row => row.label)].join('\n');
             }
         } catch (error) {
             level = 'error';
             text = error.message;
+        } finally {
+            if (interactive) {
+                this.branchCommandRunning = false;
+                this.updateInteractionStatus(this.interactions.hasPending());
+            }
         }
         if (text && this.status !== 'disposed') {
             const event = level === 'error' ? { type: 'notice', level, text } : {
@@ -704,13 +784,14 @@ export class PiCliSession {
         let images;
         try { if (input.images?.length) images = await piImageInputs(input.images); }
         catch (error) { return { accepted: false, reason: error.message }; }
-        const local = /^\/((?:pi-)?(?:suggest|tree|fork))(?:\s+([\s\S]+))?$/.exec(text.trim());
+        const local = /^\/((?:pi-)?(?:suggest|tree|fork)|restore)(?:\s+([\s\S]+))?$/.exec(text.trim());
         if (local) {
             if (this.status !== 'idle' || this.compacting) return { accepted: false, reason: 'Pi session is not idle' };
             const [, name, anchor] = local;
             return this.runLocalCommand(input, commandAliases.get(name) ?? name, anchor, '/' + name);
         }
         const commandName = /^\/([^\s]+)/.exec(text.trim())?.[1];
+        if (commandName === bridgeCommand) return { accepted: false, reason: 'This command is reserved for the Pi backend' };
         if (commandName && TUI_ONLY_COMMAND.test(commandName)) {
             return { accepted: false, reason: `/${commandName} is only available in Pi's own TUI` };
         }
@@ -865,7 +946,10 @@ export class PiCliSession {
     }
     async cancel(cause) {
         const turn = this.activeTurn;
-        if (!turn) return { stillQueued: [], outcome: 'confirmed' };
+        if (!turn) {
+            if (this.branchCommandRunning) this.interactions.cancelAll();
+            return { stillQueued: [], outcome: 'confirmed' };
+        }
         const covered = this.queued.map(item => item.id);
         turn.cancelling = true;
         try {

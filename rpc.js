@@ -66,7 +66,7 @@ export class PiRpc {
                 this.#pending.delete(id);
                 settle(value);
             };
-            const timer = setTimeout(() => {
+            const timer = timeout === null ? undefined : setTimeout(() => {
                 const error = new Error(`Pi RPC ${type} timed out`);
                 error.code = 'PI_RPC_TIMEOUT';
                 finish(reject, error);

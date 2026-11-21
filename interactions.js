@@ -1,3 +1,5 @@
+import { piPlainText } from './extension-state.js';
+
 const DIALOG_METHODS = new Set(['confirm', 'select', 'input', 'editor']);
 
 function event(type, fields) {
@@ -27,6 +29,10 @@ export class PiInteractions {
         return true;
     }
 
+    select(requestId, title, options) {
+        return new Promise(resolve => this.openQuestion({ id: requestId, method: 'select', title, options }, resolve));
+    }
+
     openPermission(record) {
         const request = {
             requestId: record.id,
@@ -49,7 +55,12 @@ export class PiInteractions {
         this.pendingChanged();
     }
 
-    openQuestion(record) {
+    openQuestion(record, resolve) {
+        const values = record.method === 'select' ? record.options ?? [] : [];
+        let labels = values.map(value => value.split('\n').map(piPlainText).join('\n').trim());
+        if (new Set(labels).size !== labels.length) {
+            labels = labels.map((label, index) => `#${index + 1} ${label}`);
+        }
         const detail = record.method === 'editor' && typeof record.prefill === 'string'
             ? `Starting value:\n${record.prefill}`
             : typeof record.placeholder === 'string' ? record.placeholder : undefined;
@@ -58,13 +69,11 @@ export class PiInteractions {
             questions: [{
                 question: record.title || 'Pi extension question',
                 ...(detail ? { detail } : {}),
-                options: record.method === 'select'
-                    ? (record.options ?? []).map(label => ({ label }))
-                    : [],
+                options: labels.map(label => ({ label })),
                 ...(record.method === 'select' ? { hideCustomInput: true } : {}),
             }],
         };
-        const entry = { request, method: record.method, timer: undefined };
+        const entry = { request, resolve, choices: new Map(labels.map((label, index) => [label, values[index]])), timer: undefined };
         entry.timer = this.scheduleTimeout(record.timeout, () => {
             this.finishQuestion(record.id, undefined, false);
         });
@@ -92,7 +101,7 @@ export class PiInteractions {
         const custom = typeof answer?.custom === 'string' ? answer.custom : undefined;
         let value;
         if (custom !== undefined && custom !== '') value = custom;
-        else if (selected.length > 0) value = selected[0];
+        else if (selected.length > 0) value = entry.choices.get(selected[0]) ?? selected[0];
         else if (custom !== undefined) value = custom;
         else return this.finishQuestion(requestId, undefined, true);
         return this.finishQuestion(requestId, value, true);
@@ -135,7 +144,8 @@ export class PiInteractions {
         if (entry === undefined) return false;
         clearTimeout(entry.timer);
         this.questions.delete(requestId);
-        if (respond) {
+        if (entry.resolve) entry.resolve(respond ? value : undefined);
+        else if (respond) {
             this.sendResponse(value === undefined
                 ? { type: 'extension_ui_response', id: requestId, cancelled: true }
                 : { type: 'extension_ui_response', id: requestId, value });
