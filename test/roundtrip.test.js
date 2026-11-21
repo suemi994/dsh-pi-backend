@@ -204,6 +204,10 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
             await tmux('send-keys', 'Enter');
             await waitForPane(reply);
         }
+        await tmux('send-keys', '-l', '/compact');
+        await waitForPane('/compact');
+        await tmux('send-keys', 'Enter');
+        await waitForPane('compacted summary text');
         await tmux('send-keys', 'C-d');
         await tmux('send-keys', 'C-d').catch(() => {});
         const deadline = Date.now() + 8000;
