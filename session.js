@@ -446,12 +446,18 @@ export class PiCliSession {
             return;
         this.stepNo += 1;
         this.curAttemptId = `att${this.turnNo}_${this.stepNo}`;
-        this.emitLive([ev({ type: 'assistant.attempt.start', attemptId: this.curAttemptId, turn: this.turnNo, step: this.stepNo, model: this.modelId })], { replay: false });
+        this.emitLive([
+            ev({ type: 'step.start', turn: this.turnNo, step: this.stepNo, time: Date.now() }),
+            ev({ type: 'assistant.attempt.start', attemptId: this.curAttemptId, turn: this.turnNo, step: this.stepNo, model: this.modelId }),
+        ], { replay: false });
     }
     closeAttempt() {
         if (!this.curAttemptId)
             return;
-        this.emitLive([ev({ type: 'assistant.attempt.end', attemptId: this.curAttemptId, turn: this.turnNo, step: this.stepNo, outcome: 'committed' })], { replay: false });
+        this.emitLive([
+            ev({ type: 'assistant.attempt.end', attemptId: this.curAttemptId, turn: this.turnNo, step: this.stepNo, outcome: 'committed' }),
+            ev({ type: 'step.end', turn: this.turnNo, step: this.stepNo, time: Date.now() }),
+        ], { replay: false });
         this.curAttemptId = '';
         this.streamed.clear();
     }

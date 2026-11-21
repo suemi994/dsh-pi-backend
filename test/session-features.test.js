@@ -97,6 +97,23 @@ test('Typing a TUI-only command explains why it cannot run', async t => {
     assert.deepEqual(result, { accepted: false, reason: "/sidebar is only available in Pi's own TUI" });
 });
 
+test('Pi emits step boundaries so dsh-tui can measure generation speed', async t => {
+    const { session, events } = fixtureSession();
+    t.after(() => session.dispose());
+    session.turnNo = 1;
+
+    session.openIfNeeded();
+    session.closeAttempt();
+
+    assert.deepEqual(events.filter(event => event.type === 'step.start' || event.type === 'step.end')
+        .map(event => [event.type, event.turn, event.step]), [
+        ['step.start', 1, 1],
+        ['step.end', 1, 1],
+    ]);
+    assert.ok(events.some(event => event.type === 'assistant.attempt.start' && event.step === 1));
+    assert.ok(events.some(event => event.type === 'assistant.attempt.end' && event.step === 1));
+});
+
 test('Pi interrupt clears queued work before aborting', async t => {
     const { session, events } = fixtureSession();
     t.after(() => session.dispose());
