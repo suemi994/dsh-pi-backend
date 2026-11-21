@@ -37,6 +37,66 @@ test('Pi extension prefill and titles project into the host session', async t =>
         && event.title === 'Extension title' && event.source === 'auto'));
 });
 
+test('TUI-only Pi extension commands stay out of the host command menu', async t => {
+    const { session } = fixtureSession();
+    t.after(() => session.dispose());
+    session.rpc = {
+        async request(type) {
+            assert.equal(type, 'get_commands');
+            return {
+                commands: [
+                    { name: 'plan', description: 'Plan mode', source: 'extension', sourceInfo: { source: 'npm:plan' } },
+                    { name: 'sidebar', description: 'Toggle sidebar', source: 'extension', sourceInfo: { source: 'git:github.com/suemi994/pi-sidebar' } },
+                    { name: 'open-tui', description: 'Open settings', source: 'extension', sourceInfo: { source: 'npm:pi-open-tui' } },
+                    { name: 'tool-display', description: 'Tool rendering', source: 'extension', sourceInfo: { source: 'npm:pi-ui-enhancement' } },
+                    { name: 'lens-widget-toggle', description: 'Toggle widget', source: 'extension', sourceInfo: { source: 'npm:pi-lens' } },
+                    { name: 'council', description: 'Prompt template', source: 'prompt', sourceInfo: { source: 'npm:pi-subagents' } },
+                    { name: 'skill:pi-subagents', description: 'Skill', source: 'skill', sourceInfo: { source: 'npm:pi-subagents' } },
+                ],
+            };
+        },
+        async close() {},
+    };
+
+    const commands = await session.capabilities.commands.list();
+    assert.deepEqual(commands.map(command => command.name), [
+        'steer', 'pi-tree', 'pi-fork', 'pi-suggest', 'plan', 'council', 'skill:pi-subagents',
+    ]);
+});
+
+test('Hidden Pi commands can be added by name', async t => {
+    const { session } = fixtureSession();
+    t.after(() => session.dispose());
+    const previous = process.env.PI_HIDDEN_COMMANDS;
+    process.env.PI_HIDDEN_COMMANDS = 'telegram-status, lens-map';
+    t.after(() => {
+        if (previous === undefined) delete process.env.PI_HIDDEN_COMMANDS;
+        else process.env.PI_HIDDEN_COMMANDS = previous;
+    });
+    session.rpc = {
+        async request() {
+            return {
+                commands: [
+                    { name: 'telegram-status', description: 'Telegram', source: 'extension', sourceInfo: {} },
+                    { name: 'lens-map', description: 'Lens map', source: 'extension', sourceInfo: {} },
+                    { name: 'plan', description: 'Plan mode', source: 'extension', sourceInfo: {} },
+                ],
+            };
+        },
+        async close() {},
+    };
+
+    const commands = await session.capabilities.commands.list();
+    assert.deepEqual(commands.map(command => command.name), ['steer', 'pi-tree', 'pi-fork', 'pi-suggest', 'plan']);
+});
+
+test('Typing a TUI-only command explains why it cannot run', async t => {
+    const { session } = fixtureSession();
+    t.after(() => session.dispose());
+    const result = await session.submit({ text: '/sidebar', clientMessageId: 'tui-only' }, 'turn');
+    assert.deepEqual(result, { accepted: false, reason: "/sidebar is only available in Pi's own TUI" });
+});
+
 test('Pi interrupt clears queued work before aborting', async t => {
     const { session, events } = fixtureSession();
     t.after(() => session.dispose());

@@ -14,6 +14,22 @@ import { createPiPromptInjector } from './prompt-injection.js';
 function ev(e) {
     return e;
 }
+// Pi extensions register commands before they know which host mode they will
+// run in. TUI-only plugins such as pi-sidebar therefore keep advertising their
+// slash commands under RPC, where their `ctx.mode === "tui"` guards and
+// `ctx.ui.custom()` calls are no-ops. Hide those commands from dsh-tui's menu.
+const TUI_ONLY_COMMAND = /^(?:sidebar(?:-.*)?|sessions-manager|btw-resume|tool-view|tool-display|open-tui|lens-widget-toggle)$/u;
+const TUI_ONLY_SOURCES = new Set([
+    'git:github.com/suemi994/pi-sidebar',
+    'npm:pi-open-tui',
+    'npm:pi-ui-enhancement',
+]);
+function isTuiOnlyCommand(command) {
+    return TUI_ONLY_COMMAND.test(command.name) || TUI_ONLY_SOURCES.has(command.sourceInfo?.source);
+}
+function configuredHiddenCommands() {
+    return new Set((process.env.PI_HIDDEN_COMMANDS ?? '').split(',').map(name => name.trim()).filter(Boolean));
+}
 export class PiCliSession {
     backendId = 'pi';
     sessionId;
@@ -175,12 +191,14 @@ export class PiCliSession {
     }
     async listCommands() {
         const { commands } = await this.rpc.request('get_commands');
+        const hidden = configuredHiddenCommands();
         return [
             { name: 'steer', description: 'Send an instruction at the next Pi tool boundary' },
             { name: 'pi-tree', description: 'Show Pi branches, or inspect one with /pi-tree <entry-id>' },
             { name: 'pi-fork', description: 'Fork a Pi tree node with /pi-fork <entry-id>' },
             { name: 'pi-suggest', description: 'Suggest next prompts based on this conversation' },
-            ...commands.filter(({ name }) => !['steer', 'pi-tree', 'pi-fork', 'pi-suggest'].includes(name))
+            ...commands.filter(command => !['steer', 'pi-tree', 'pi-fork', 'pi-suggest'].includes(command.name)
+                    && !hidden.has(command.name) && !isTuiOnlyCommand(command))
                 .map(({ name, description }) => ({ name, description })),
         ];
     }
@@ -660,6 +678,10 @@ export class PiCliSession {
         const local = /^(\/pi-suggest|\/pi-tree|\/pi-fork)(?:\s+([\s\S]+))?$/.exec(text.trim());
         if (local && this.status === 'idle' && !this.compacting) return this.runLocalCommand(input, local[1], local[2]);
         if (local) return { accepted: false, reason: 'Pi session is not idle' };
+        const commandName = /^\/([^\s]+)/.exec(text.trim())?.[1];
+        if (commandName && TUI_ONLY_COMMAND.test(commandName)) {
+            return { accepted: false, reason: `/${commandName} is only available in Pi's own TUI` };
+        }
         if (this.activeTurn && !this.activeTurn.settling && !this.activeTurn.cancelling && ['steer', 'followup'].includes(placement)) {
             return this.submitQueued(input, placement, message, images);
         }
