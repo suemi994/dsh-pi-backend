@@ -61,6 +61,7 @@ export class PiCliSession {
         },
         images: { limits: piImageLimits },
         sideQuery: { ask: (prompt, options) => askPiSideQuery(this, prompt, options) },
+        promptSuggestion: { suggest: signal => this.suggestFollowUp(signal) },
         commands: { localOverrides, list: () => this.listCommands() },
         infoStatus: createPiExtensionState(),
         context: { usage: async () => {
@@ -615,6 +616,16 @@ export class PiCliSession {
         return () => {
             this.listeners.delete(listener);
         };
+    }
+    async suggestFollowUp(signal) {
+        const locale = this.host.locale?.() === 'zh' ? 'Chinese' : 'English';
+        const { answer } = await this.capabilities.sideQuery.ask(
+            `Predict one short follow-up message the user would naturally send next, in ${locale}. Write it from the user's perspective. Return one plain-text line under 140 characters, with no quotes or markup. If there is no clear follow-up, return NONE.`,
+            { signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]) });
+        const text = answer?.trim();
+        if (!text || text === 'NONE' || text.length > 160 || /^[!/`]/u.test(text)
+            || /[\p{Cc}\u2028\u2029]/u.test(text)) return;
+        return text;
     }
     async runLocalCommand(input, command, anchor, label) {
         this.emitLive([ev({ type: 'pending.changed', items: [], claimed: [input.clientMessageId] })], { replay: false });

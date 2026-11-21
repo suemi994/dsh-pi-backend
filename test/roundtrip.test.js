@@ -45,7 +45,9 @@ function mockProvider(requests, summaries, sideRequests, extra) {
             }
             const extraReply = await extra?.(prompt, input);
             const reply = extraReply ?? (side
-                ? prompt.includes('Create a compact session recap')
+                ? prompt.includes('Predict one short follow-up message')
+                    ? prompt.includes(turns[2][0]) ? 'NONE' : 'Show me the next step.'
+                : prompt.includes('Create a compact session recap')
                     ? JSON.stringify({ title: 'Pi round-trip recap', summary: 'Side recap from Pi' })
                     : prompt.includes('Which branch is active?') ? 'Side branch answer from Pi' : 'Side answer from Pi'
                 : turns.find(([text]) => text === prompt)?.[1]);
@@ -330,6 +332,16 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
             await tmux('send-keys', '-l', prompt);
             await tmux('send-keys', 'Enter');
             await waitForPane(reply);
+            if (index === 0) {
+                await waitForPane('Tab to accept · Show me the next step.');
+                const beforeTab = requests.length;
+                await tmux('send-keys', 'Tab');
+                await waitForPane(/❯.*Show me the next step\./);
+                await waitForPane('Tab to accept', false);
+                assert.equal(requests.length, beforeTab, 'Tab accepts the suggestion into the draft');
+                await tmux('send-keys', 'C-u');
+                await waitForPane('Show me the next step.', false);
+            }
         }
         const continuedContext = await contextReadout();
         assert.notEqual(continuedContext, initialContext, 'continued conversation must move the context readout');

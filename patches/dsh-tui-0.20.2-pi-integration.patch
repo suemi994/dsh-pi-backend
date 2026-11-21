@@ -1,12 +1,13 @@
 diff --git a/lib/types/adapter/channel/ui-policy.js b/lib/types/adapter/channel/ui-policy.js
-index d990fa3..1ffe34d 100644
+index d990fa3..da5b3ca 100644
 --- a/lib/types/adapter/channel/ui-policy.js
 +++ b/lib/types/adapter/channel/ui-policy.js
-@@ -151,6 +151,7 @@ export const CHANNEL_UI_PROPERTIES = [
+@@ -151,6 +151,8 @@ export const CHANNEL_UI_PROPERTIES = [
      'sessionId',
      'agentBindingGeneration',
      'sessionRef',
 +    'infoStatus',
++    'promptSuggestion',
      'backendCapabilities',
      'costReport',
      'rateLimit',
@@ -67,10 +68,18 @@ index 5c763a5..ca43853 100644
 +    return (_jsx(Box, { flexDirection: "column", paddingLeft: 1, paddingRight: 1, width: width, flexShrink: 0, children: _jsxs(ScrollBox, { ref: scrollRef, flexDirection: "column", maxHeight: Math.max(3, height), flexGrow: 1, children: [channel.infoStatus?.map(([key, text]) => _jsx(Text, { children: text }, key)), _jsxs(Section, { title: t('info-section-session'), children: [_jsx(Row, { label: t('info-row-title'), value: channel.sessionTitle !== '' ? channel.sessionTitle : none }), _jsx(Row, { label: t('info-row-session-id'), value: channel.sessionId !== '' ? '#' + channel.sessionId.slice(0, 8) : none }), _jsx(Row, { label: t('info-row-agent-id'), value: channel.agentId !== '' ? '#' + channel.agentId.slice(0, 8) : none }), _jsx(Row, { label: t('info-row-cwd'), value: displayCwd !== '' ? displayCwd : none }), _jsx(Row, { label: t('info-row-branch'), value: channel.gitBranch !== undefined && channel.gitBranch !== '' ? channel.gitBranch : none })] }), _jsxs(Section, { title: t('info-section-model'), children: [_jsx(Row, { label: t('info-row-model'), value: channel.model !== '' ? channel.model : none }), _jsx(Row, { label: t('info-row-effort'), value: channel.reasoningEffort !== undefined && channel.reasoningEffort !== '' ? channel.reasoningEffort : none }), _jsx(Row, { label: t('info-row-mode'), value: modeName, valueColor: channel.mode.plan === true ? 'planMode' : modeNeedsExplicitMarker(channel.mode) ? 'warning' : undefined }), _jsx(Row, { label: t('info-row-approval'), value: approval !== undefined && approval !== '' ? approval : none, valueColor: modeNeedsExplicitMarker(channel.mode) ? 'warning' : undefined })] }), _jsxs(Section, { title: t('info-section-context'), children: [_jsx(Row, { label: t('info-row-context'), value: contextText ?? none, valueColor: contextStep }), _jsx(Row, { label: t('info-row-window'), value: channel.contextWindow !== undefined ? formatTokens(channel.contextWindow) : none }), _jsx(Row, { label: t('info-row-tokens'), value: formatTokens(channel.tokens.input) + '→' + formatTokens(channel.tokens.output) }), _jsx(Row, { label: t('info-row-cache'), value: cacheText }), _jsx(Row, { label: t('info-row-cost'), value: costText }), _jsx(Row, { label: t('info-row-tps'), value: tpsText })] }), _jsxs(Section, { title: t('info-section-runtime'), children: [_jsx(Row, { label: t('info-row-status'), value: String(channel.status) }), _jsx(Row, { label: t('info-row-activity'), value: channel.working ? channel.spinnerMode : none, valueColor: channel.working ? 'success' : undefined }), _jsx(Row, { label: t('info-row-jobs'), value: jobsText }), _jsx(Row, { label: t('info-row-subagents'), value: subagentsText })] })] }) }));
  }
 diff --git a/lib/types/dsh-adapter/channel/core/compose.js b/lib/types/dsh-adapter/channel/core/compose.js
-index 2677f13..94c6997 100644
+index 2677f13..fc7ecd3 100644
 --- a/lib/types/dsh-adapter/channel/core/compose.js
 +++ b/lib/types/dsh-adapter/channel/core/compose.js
-@@ -420,6 +420,9 @@ export function createCoreChannel(ctx, initialSession, options, owner) {
+@@ -413,6 +413,7 @@ export function createCoreChannel(ctx, initialSession, options, owner) {
+         get team() {
+             return team?.teamOf(state.sessionId);
+         },
++        promptSuggestion: undefined,
+         commandList: localCommandsFor(initialCapabilities.commands),
+         backendCapabilities: initialCapabilities,
+         capabilities: () => extension.agentCapabilities?.() ?? sessionAgentCapabilities(),
+@@ -420,6 +421,9 @@ export function createCoreChannel(ctx, initialSession, options, owner) {
              const ref = binding.session.ref;
              return { backendId: ref.backendId, sessionId: ref.sessionId };
          },
@@ -80,19 +89,20 @@ index 2677f13..94c6997 100644
          get liveTurnEnds() { return feed.liveTurnEnds(); },
          costReport: undefined,
          rateLimit: undefined,
-@@ -728,6 +731,7 @@ export function createCoreChannel(ctx, initialSession, options, owner) {
+@@ -728,6 +732,8 @@ export function createCoreChannel(ctx, initialSession, options, owner) {
          }));
      }
      const controls = createSessionControls({ state: () => state, backendLabel: () => state.backendCapabilities.backendLabel });
 +    owner.own(controls.stopInfoStatus);
++    owner.own(controls.clearPromptSuggestion);
      const feed = createBindingFeed(ctx, {
          owner,
          binding,
 diff --git a/lib/types/dsh-adapter/channel/core/session-controls.js b/lib/types/dsh-adapter/channel/core/session-controls.js
-index ba848cc..36d8feb 100644
+index ba848cc..222347d 100644
 --- a/lib/types/dsh-adapter/channel/core/session-controls.js
 +++ b/lib/types/dsh-adapter/channel/core/session-controls.js
-@@ -24,23 +24,41 @@ const debugFailure = (what) => (error) => {
+@@ -24,23 +24,67 @@ const debugFailure = (what) => (error) => {
      logForDebugging(`channel: ${what} failed (${error instanceof Error ? error.message : String(error)})`);
  };
  export function createSessionControls(deps) {
@@ -100,6 +110,32 @@ index ba848cc..36d8feb 100644
      let backendCommands = [];
 +    let localOverrides = [];
 +    let unsubscribeInfoStatus;
++    let suggestionRequest;
++    let answeredTurn;
++    const clearPromptSuggestion = () => {
++        suggestionRequest?.abort();
++        suggestionRequest = undefined;
++        const state = deps.state();
++        const hadSuggestion = state.promptSuggestion !== undefined;
++        state.promptSuggestion = undefined;
++        return hadSuggestion;
++    };
++    const suggestFollowUp = (session, current, turn) => {
++        const capability = session.capabilities.promptSuggestion;
++        if (capability === undefined || answeredTurn !== turn)
++            return;
++        answeredTurn = undefined;
++        const request = new AbortController();
++        suggestionRequest = request;
++        void Promise.resolve().then(() => capability.suggest(request.signal)).then(text => {
++            if (text && !request.signal.aborted && current()) {
++                const state = deps.state();
++                state.promptSuggestion = { turn, text };
++                state.emit();
++            }
++        }).catch(debugFailure('prompt suggestion'));
++    };
++
 +    const stopInfoStatus = () => {
 +        unsubscribeInfoStatus?.();
 +        unsubscribeInfoStatus = undefined;
@@ -142,7 +178,7 @@ index ba848cc..36d8feb 100644
      };
      const loadBackendCommands = (session, current) => {
          const commands = session.capabilities.commands;
-@@ -49,13 +67,7 @@ export function createSessionControls(deps) {
+@@ -49,13 +93,7 @@ export function createSessionControls(deps) {
          void commands.list().then(list => {
              if (!current())
                  return;
@@ -157,11 +193,13 @@ index ba848cc..36d8feb 100644
              refreshCommandList();
              deps.state().emit();
          }).catch(debugFailure('backend commands'));
-@@ -124,7 +136,16 @@ export function createSessionControls(deps) {
+@@ -124,7 +162,18 @@ export function createSessionControls(deps) {
      };
      /** A freshly bound session: read what it already knows. */
      const seed = (session, current) => {
 +        stopInfoStatus();
++        answeredTurn = undefined;
++        clearPromptSuggestion();
 +        unsubscribeInfoStatus = session.capabilities.infoStatus?.subscribe(() => {
 +            if (current())
 +                deps.state().emit();
@@ -174,11 +212,44 @@ index ba848cc..36d8feb 100644
          mcpLines = undefined;
          mcpNames = undefined;
          const modes = session.capabilities.modes;
-@@ -196,13 +217,16 @@ export function createSessionControls(deps) {
+@@ -158,6 +207,21 @@ export function createSessionControls(deps) {
+         let changed = false;
+         for (const event of batch) {
+             switch (event.type) {
++                case 'turn.start':
++                    answeredTurn = undefined;
++                    changed = clearPromptSuggestion() || changed;
++                    break;
++                case 'assistant.message':
++                    if (event.blocks.some(block => block.type === 'text' && block.text.trim() !== ''))
++                        answeredTurn = event.turn;
++                    break;
++                case 'compaction.start':
++                    changed = clearPromptSuggestion() || changed;
++                    break;
++                case 'session.status':
++                    if (event.status === 'disposed')
++                        changed = clearPromptSuggestion() || changed;
++                    break;
+                 case 'mode.changed':
+                     applyMode(session, event.modeId);
+                     changed = true;
+@@ -184,6 +248,8 @@ export function createSessionControls(deps) {
+                     changed = true;
+                     break;
+                 case 'turn.end':
++                    if (event.reason.kind === 'completed')
++                        suggestFollowUp(session, current, event.turn);
+                     refreshContext(session, current);
+                     refreshMcp(session, current);
+                     break;
+@@ -196,13 +262,19 @@ export function createSessionControls(deps) {
      };
      /** A session switch: forget the replaced session's commands and reports. */
      const reset = () => {
 +        stopInfoStatus();
++        answeredTurn = undefined;
++        clearPromptSuggestion();
          backendCommands = [];
 +        localOverrides = [];
          mcpLines = undefined;
@@ -188,6 +259,7 @@ index ba848cc..36d8feb 100644
      return {
          seed,
 +        stopInfoStatus,
++        clearPromptSuggestion,
          observe,
          reset,
          refreshCommandList,
@@ -205,3 +277,67 @@ index 805ed9a..1a647f9 100644
          switch (name) {
              case 'activity': {
                  // Ported from the pi working-activity extension: bare `/activity`
+diff --git a/lib/types/components/PromptInput.js b/lib/types/components/PromptInput.js
+index 8d2e612..694c758 100644
+--- a/lib/types/components/PromptInput.js
++++ b/lib/types/components/PromptInput.js
+@@ -359,6 +359,7 @@ export function PromptInput({ channel, mentionProviders, toastSuppressed, suspen
+     // Adopting after mount keeps the first frame identical to a fresh composer
+     // while still handing the draft back.
+     const [value, setValue] = React.useState('');
++    const [acceptedSuggestion, setAcceptedSuggestion] = React.useState();
+     const [cursor, setCursor] = React.useState(0);
+     /**
+      * Adopt the owner's draft ONCE, after mount.
+@@ -2171,6 +2172,12 @@ export function PromptInput({ channel, mentionProviders, toastSuppressed, suspen
+         const line = before.split('\n').pop() ?? '';
+         return line.length;
+     };
++    const suggestion = channel.promptSuggestion;
++    const suggestionId = suggestion === undefined ? undefined : `${channel.sessionId}:${suggestion.turn}`;
++    const visibleSuggestion = suggestionId !== acceptedSuggestion && value === '' &&
++        draftImagesRef.current.size === 0 && channel.pending.length === 0 &&
++        channel.status === 'idle' && !channel.working && !expanded && !helpOpen &&
++        !selectionActive && (!vimEnabled || vimInsert) ? suggestion : undefined;
+     useInput((input, key, event) => {
+         if (selectionActive)
+             return;
+@@ -2653,6 +2660,13 @@ export function PromptInput({ channel, mentionProviders, toastSuppressed, suspen
+             }
+             return;
+         }
++        if (key.tab && !key.ctrl && !key.meta && !key.super && value === '' &&
++            !channel.working && visibleSuggestion !== undefined) {
++            event.stopImmediatePropagation();
++            setAcceptedSuggestion(suggestionId);
++            setInput(visibleSuggestion.text, visibleSuggestion.text.length, 'step');
++            return;
++        }
+         // Tab while the model is working = queue for AFTER the turn (followup),
+         // distinct from Enter's steer (Codex's "tab to queue message").
+         if (key.tab && channel.working && value.trim() !== '') {
+@@ -3964,7 +3978,11 @@ export function PromptInput({ channel, mentionProviders, toastSuppressed, suspen
+     // editor layer, or external injection controller.
+     if (suspended)
+         return null;
+-    return (_jsxs(Box, { flexDirection: "column", marginTop: 1, children: [floatersOpen && (_jsxs(OverlayAbove, { maxHeight: Math.max(terminalRows - 6, 1), children: [helpOpen && (_jsx(Box, { marginBottom: 1, children: _jsx(HelpMenu, { commands: channel.commandList, viewportHeight: helpViewportHeight, viewportWidth: columns, scrollRef: helpScrollRef, onCommandPick: (name) => {
++    return (_jsxs(Box, { flexDirection: "column", marginTop: 1, children: [
++        visibleSuggestion !== undefined && _jsx(Box, { paddingLeft: 2, children: _jsx(Text, {
++            dimColor: true, wrap: 'truncate-end', children: `${t('input-suggestion-accept')} · ${visibleSuggestion.text}`,
++        }) }),
++        floatersOpen && (_jsxs(OverlayAbove, { maxHeight: Math.max(terminalRows - 6, 1), children: [helpOpen && (_jsx(Box, { marginBottom: 1, children: _jsx(HelpMenu, { commands: channel.commandList, viewportHeight: helpViewportHeight, viewportWidth: columns, scrollRef: helpScrollRef, onCommandPick: (name) => {
+                                 // 点击命令行 = 填入 /name 并关闭帮助（Tab 补全的鼠标等价）
+                                 updateFoldBlock(null);
+                                 // `/${name} ` — the whole fill is one undo step.
+diff --git a/lib/types/i18n.js b/lib/types/i18n.js
+index 01c95b0..990d49b 100644
+--- a/lib/types/i18n.js
++++ b/lib/types/i18n.js
+@@ -1080,6 +1080,7 @@ const dict = {
+     'input-image-paste-limit': { zh: '图片数量超过当前配置的单条消息上限', en: 'Image count exceeds the per-message limit for this profile' },
+     'input-image-format-unsupported': { zh: '剪贴板图片格式不受支持；请使用 PNG、JPEG、WebP 或 GIF', en: 'Clipboard image format is unsupported; use PNG, JPEG, WebP, or GIF' },
+     'input-pending-steer-label': { zh: '插话 · 下一步送达', en: 'Steer · delivered next' },
++    'input-suggestion-accept': { zh: 'Tab 接受', en: 'Tab to accept' },
+     'input-pending-queue-label': { zh: '排队 · 回合结束后送达', en: 'Queued · delivered after the turn' },
+     'input-pending-actions-hint': { zh: '撤回 · Esc 打断并暂存排队消息', en: 'Retract · Esc interrupts and holds the queue' },
+     'input-pending-actions-hint-disposed': { zh: '撤回', en: 'Retract' },
