@@ -412,8 +412,11 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
         await waitForContextChange(continuedContext);
         await tmux('send-keys', '-l', '/restore');
         await tmux('send-keys', 'Enter');
-        await waitForPane('Fixture checkpoint');
-        await tmux('send-keys', 'Down', 'Enter');
+        await waitForPane(/❯● Keep current/);
+        await tmux('send-keys', 'Down');
+        await waitForPane(/❯● Restore first reply/);
+        await tmux('send-keys', 'Enter');
+        await waitForPane('Fixture checkpoint', false);
         await waitForPane(turns[0][1]);
         await waitForPane(turns[2][1], false);
         assert.deepEqual(messages(await readFile(file, 'utf8')).slice(0, 6), transcript.slice(0, 6));
