@@ -7,7 +7,8 @@ import { dirname, join } from 'node:path';
 import { modelSpec } from './catalog-models.js';
 import { PiRpc } from './rpc.js';
 import { askPiSideQuery } from './side-query.js';
-import { createPiExtensionState, piPlainText, piTodos, piSubagents } from './extension-state.js';
+import { createPiExtensionState, piPlainText, piTodos, piTodoEntry, piSubagents,
+    piBackgroundStart, piBackgroundEnds } from './extension-state.js';
 import { piImageInputs, piImageLimits, piTranscriptImages } from './images.js';
 import { PiInteractions } from './interactions.js';
 import { piToolCall, piToolResult } from './presentation.js';
@@ -163,6 +164,8 @@ export class PiCliSession {
     queued = [];
     interactions;
     childStates = new Map();
+    backgroundRuns = new Map();
+    todoSnapshot;
     acceptsImages;
     streamed = new Set();
     compacting = false;
@@ -290,8 +293,11 @@ export class PiCliSession {
     async captureAnchors(turn) {
         try {
             const fields = this.entryCursor ? { since: this.entryCursor } : {};
-            const { entries } = await this.rpc.request('get_entries', fields, 3000);
+            const { entries, leafId } = await this.rpc.request('get_entries', fields, 3000);
             this.entryCursor = entries.at(-1)?.id ?? this.entryCursor;
+            // Nested todo calls persist a snapshot without emitting a standalone tool result.
+            const todo = piBranch(entries, leafId).map(piTodoEntry).findLast(Boolean);
+            if (todo) this.emitLive(this.updateTodo(todo), { replay: false });
             const users = entries.filter(entry => entry.message?.role === 'user');
             if (users.length > 0 && users.length === turn.userAnchors.length) {
                 users.forEach((entry, index) => this.liveAnchors.set(turn.userAnchors[index], entry.id));
@@ -386,6 +392,15 @@ export class PiCliSession {
         if (this.interactions.hasPending()) this.setStatus('requires-action');
     }
     replayEntry(o) {
+        const todo = piTodoEntry(o);
+        if (todo) {
+            this.pushHistory(this.updateTodo(todo));
+            return;
+        }
+        if (o?.type === 'custom_message') {
+            this.pushHistory(this.backgroundNotice(o, Date.parse(o.timestamp) || Date.now()));
+            return;
+        }
         if (o?.type === 'compaction' || o?.type === 'branch_summary') {
             // A checkpoint in the native file is settled history: show its summary
             // the same way a live compaction does.
@@ -545,10 +560,28 @@ export class PiCliSession {
             errorText: isError ? text : undefined, presentation: piToolResult(call?.name, call?.args, result, isError) });
     }
     toolState(id, name, result, final, isError, time = Date.now()) {
-        name ||= this.toolSteps.get(id)?.name;
-        if (name === 'subagent') return piSubagents(id, result?.details, this.childStates, time, final, isError);
+        const call = this.toolSteps.get(id);
+        name ||= call?.name;
+        const details = result?.details;
+        if (name === 'subagent') {
+            const launch = final && !isError && piBackgroundStart(id, call?.args, details, this.backgroundRuns, time);
+            if (launch) return [launch];
+            return [...piSubagents(id, details, this.childStates, time, final, isError),
+                ...(final ? piBackgroundEnds(details?.completions, this.backgroundRuns, time) : [])];
+        }
+        if (name === 'bg_wait' && final) return piBackgroundEnds(details?.completions, this.backgroundRuns, time);
         const todo = final && !isError && piTodos(name, result?.details);
-        return todo ? [todo] : [];
+        return todo ? this.updateTodo(todo) : [];
+    }
+    updateTodo(todo) {
+        const snapshot = JSON.stringify(todo.items);
+        if (snapshot === this.todoSnapshot) return [];
+        this.todoSnapshot = snapshot;
+        return [todo];
+    }
+    backgroundNotice(message, time = Date.now()) {
+        return message?.customType === 'subagent-notify'
+            ? piBackgroundEnds(message.details?.runs, this.backgroundRuns, time) : [];
     }
     emitPending(change = {}) {
         this.emitLive([{ type: 'pending.changed',
@@ -652,6 +685,8 @@ export class PiCliSession {
         this.liveAnchors.clear();
         this.toolSteps.clear();
         this.childStates.clear();
+        this.backgroundRuns.clear();
+        this.todoSnapshot = undefined;
         this.entryCursor = entries.at(-1)?.id;
         for (const entry of piBranch(entries, leafId)) this.replayEntry(entry);
         if (this.turnNo) this.pushHistory([{ type: 'turn.end', turn: this.turnNo,
@@ -896,6 +931,11 @@ export class PiCliSession {
                     source: 'compaction', text: summary, blocks: [{ type: 'text', text: summary }],
                 })], { replay: false });
             }
+            return;
+        }
+        // A background run may finish while the parent session is idle.
+        if (record.type === 'message_end' && record.message?.role === 'custom') {
+            this.emitLive(this.backgroundNotice(record.message), { replay: false });
             return;
         }
         const turn = this.activeTurn;

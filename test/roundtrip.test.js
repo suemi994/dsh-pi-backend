@@ -262,14 +262,16 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
     const profile = process.env.PI_TUI_TEST_DSH_HOME;
     if (profile) {
         let parentId = entries(seeded).at(-1).id;
-        const sidebarResults = [
-            ['f17e0001', 'todo', { todos: [{ text: 'Review Pi todo fixture', done: false }] }],
-            ['f17e0002', 'subagent', { results: [{ agent: 'reviewer', task: 'Pi child fixture', status: 'completed' }] }],
+        const sidebarEntries = [
+            { type: 'custom', customType: 'rpiv-todo-state',
+                data: { tasks: [{ id: 1, subject: 'Review Pi todo fixture', status: 'in_progress' }], nextId: 2 } },
+            { type: 'message', message: { role: 'toolResult', toolCallId: 'fixture-child', toolName: 'subagent',
+                content: [], isError: false, timestamp: Date.now(),
+                details: { results: [{ index: 0, agent: 'reviewer', task: 'Pi child fixture', exitCode: 0 }] } } },
         ];
-        for (const [id, toolName, details] of sidebarResults) {
-            const timestamp = Date.now();
-            await appendFile(file, JSON.stringify({ type: 'message', id, parentId, timestamp: new Date(timestamp).toISOString(),
-                message: { role: 'toolResult', toolCallId: id, toolName, content: [], isError: false, details, timestamp } }) + '\n');
+        for (const [index, entry] of sidebarEntries.entries()) {
+            const id = `f17e000${index + 1}`;
+            await appendFile(file, JSON.stringify({ ...entry, id, parentId, timestamp: new Date().toISOString() }) + '\n');
             parentId = id;
         }
         const socket = `pi-roundtrip-${process.pid}`;
@@ -673,22 +675,58 @@ test('Pi extension todos and subagents project live and on replay', async () => 
     const todos = { todos: [{ text: 'First task', done: false }, { text: 'Done task', done: true }] };
     session.onRecord({ type: 'tool_execution_end', toolCallId: 'todo-1', toolName: 'todo', result: { details: todos } });
     session.onRecord({ type: 'tool_execution_start', toolCallId: 'delegate', toolName: 'subagent' });
-    const agent = { agent: 'reviewer', task: 'Review the changes', status: 'running' };
+    const agent = { index: 3, agent: 'reviewer', task: 'Review the changes', exitCode: 0 };
     session.onRecord({ type: 'tool_execution_update', toolCallId: 'delegate', toolName: 'subagent',
-        partialResult: { details: { results: [agent] } } });
-    const result = { details: { results: [{ ...agent, status: 'completed' }] } };
+        partialResult: { details: { results: [{ ...agent, progress: { status: 'running' } }] } } });
+    assert.equal((await session.history()).filter(event => event.type === 'subagent.end').length, 0);
+    const result = { details: { results: [{ ...agent, finalOutput: 'Review finished' }] } };
     session.onRecord({ type: 'tool_execution_end', toolCallId: 'delegate', toolName: 'subagent', result });
     const replay = new PiCliSession({ kind: 'new', cwd: '/tmp' }, {});
     replay.replayEntry({ type: 'message', message: { role: 'toolResult', toolName: 'todo', toolCallId: 'todo-1', details: todos } });
     replay.replayEntry({ type: 'message', message: { role: 'toolResult', toolName: 'subagent', toolCallId: 'delegate', ...result } });
+    const nativeTodos = { tasks: [{ id: 1, subject: 'Review changes', status: 'in_progress' },
+        { id: 2, subject: 'Discarded task', status: 'deleted' }], nextId: 3 };
+    const todoEntry = { type: 'custom', customType: 'rpiv-todo-state', id: 'todo-state', data: nativeTodos };
+    session.onRecord({ type: 'tool_execution_end', toolCallId: 'todo-2', toolName: 'todo', result: { details: nativeTodos } });
+    session.rpc = { request: async () => ({ entries: [todoEntry], leafId: todoEntry.id }) };
+    await session.captureAnchors({ userAnchors: [] });
+    replay.replayEntry(todoEntry);
+    const clearedTodo = { ...todoEntry, id: 'todo-clear', parentId: todoEntry.id, data: { tasks: [], nextId: 1 } };
+    const inactiveTodo = { ...todoEntry, id: 'todo-sibling', parentId: todoEntry.id };
+    session.rpc = { request: async () => ({ entries: [clearedTodo, inactiveTodo], leafId: clearedTodo.id }) };
+    await session.captureAnchors({ userAnchors: [] });
+    replay.replayEntry(clearedTodo);
+
+    const launchArgs = { async: true, agent: 'builder', task: 'Build the changes' };
+    const launch = { details: { mode: 'single', runId: 'build-run', asyncId: 'build-run', results: [] } };
+    const notice = { customType: 'subagent-notify', details: { runs: [{ runId: 'build-run', status: 'completed' }] } };
+    session.onRecord({ type: 'tool_execution_start', toolCallId: 'build-call', toolName: 'subagent', args: launchArgs });
+    session.onRecord({ type: 'tool_execution_end', toolCallId: 'build-call', toolName: 'subagent', result: launch });
+    session.activeTurn.resolve = () => {};
+    session.finishTurn({ kind: 'completed' });
+    session.onRecord({ type: 'message_end', message: { role: 'custom', ...notice } });
+    session.onRecord({ type: 'message_end', message: { role: 'custom', ...notice } });
+    replay.replayEntry({ type: 'message', message: { role: 'assistant', content: [
+        { type: 'toolCall', id: 'build-call', name: 'subagent', arguments: launchArgs },
+    ] } });
+    replay.replayEntry({ type: 'message', message: { role: 'toolResult', toolName: 'subagent', toolCallId: 'build-call', ...launch } });
+    replay.replayEntry({ type: 'custom_message', ...notice });
+
     for (const instance of [session, replay]) {
         const events = await instance.history();
-        assert.deepEqual(events.find(event => event.type === 'todo.write').items, [
-            { content: 'First task', status: 'pending' }, { content: 'Done task', status: 'completed' },
+        assert.deepEqual(events.filter(event => event.type === 'todo.write').map(event => event.items), [
+            [{ content: 'First task', status: 'pending' }, { content: 'Done task', status: 'completed' }],
+            [{ content: 'Review changes', status: 'in_progress' }],
+            [],
         ]);
         const children = events.filter(event => event.type.startsWith('subagent.'));
-        assert.deepEqual(children.map(event => event.type), ['subagent.start', 'subagent.end']);
+        assert.deepEqual(children.map(event => event.type), ['subagent.start', 'subagent.end', 'subagent.start', 'subagent.end']);
         assert.equal(children[0].agentId, children[1].agentId);
         assert.equal(children[1].status, 'completed');
+        assert.equal(children[1].summary, 'Review finished');
+        assert.equal(children[2].background, true);
+        assert.equal(children[2].description, launchArgs.task);
+        assert.equal(children[2].agentId, children[3].agentId);
+        assert.equal(children[3].status, 'completed');
     }
 });
