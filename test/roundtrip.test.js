@@ -63,12 +63,16 @@ function mockProvider(requests, summaries, sideRequests, extra) {
             if (!side) requests.push({ messages, effort: input.reasoning_effort });
 
             res.writeHead(200, { 'content-type': 'text/event-stream' });
+            // Simulate a provider whose prompt grows with the conversation. Pi
+            // anchors its current-context estimate to this sample.
+            const promptTokens = 1400 + input.messages.length * 100;
             const send = (choice, usage) => res.write(`data: ${JSON.stringify({
                 id: 'chatcmpl-roundtrip', object: 'chat.completion.chunk', created: 1, model,
                 choices: [{ index: 0, ...choice }], usage,
             })}\n\n`);
             send({ delta: { role: 'assistant', content: reply }, finish_reason: null });
-            send({ delta: {}, finish_reason: 'stop' }, { prompt_tokens: 42, completion_tokens: 7, total_tokens: 49, prompt_tokens_details: { cached_tokens: 12 } });
+            send({ delta: {}, finish_reason: 'stop' }, { prompt_tokens: promptTokens, completion_tokens: 7,
+                total_tokens: promptTokens + 7, prompt_tokens_details: { cached_tokens: 12 } });
             res.end('data: [DONE]\n\n');
         } catch (error) {
             res.writeHead(400, { 'content-type': 'application/json' });
@@ -258,6 +262,23 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
             }
             assert.fail(`TUI did not display ${expected}:\n${screen}`);
         };
+        const contextReadout = async () => {
+            const screen = (await tmux('capture-pane', '-p', '-S', '-100')).stdout;
+            const matches = [...screen.matchAll(/\d+(?:\.\d+)?% \(([^)]+)\)/g)];
+            assert.ok(matches.length > 0, `TUI did not display a context readout:\n${screen}`);
+            return matches.at(-1)[1];
+        };
+        const waitForContextChange = async previous => {
+            const deadline = Date.now() + 5000;
+            let screen = '';
+            while (Date.now() < deadline) {
+                screen = (await tmux('capture-pane', '-p', '-S', '-100')).stdout;
+                const match = [...screen.matchAll(/\d+(?:\.\d+)?% \(([^)]+)\)/g)].at(-1);
+                if (match !== undefined && match[1] !== previous) return match[1];
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            assert.fail(`TUI context readout stayed at ${previous}:\n${screen}`);
+        };
         await tmux('new-session', '-d', '-x', '120', '-y', '40', '-c', cwd, 'env',
             `HOME=${isolatedHome}`,
             `DSH_HOME=${profile}`, 'DSH_TUI_LANG=en', ...Object.entries(env).filter(([, value]) => value !== undefined).map(([key, value]) => `${key}=${value}`),
@@ -269,6 +290,7 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
         await waitForPane(turns[0][0]);
         await tmux('send-keys', 'Enter');
         await waitForPane(turns[0][1]);
+        const initialContext = await contextReadout();
         await tmux('send-keys', '-l', '/panel');
         await tmux('send-keys', 'Enter');
         await waitForPane('Open panel');
@@ -289,10 +311,12 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
             await tmux('send-keys', 'Enter');
             await waitForPane(reply);
         }
+        const continuedContext = await contextReadout();
+        assert.notEqual(continuedContext, initialContext, 'continued conversation must move the context readout');
         await tmux('send-keys', '-l', '/panel info');
         await tmux('send-keys', 'Enter');
         await waitForPane('Cache hit');
-        await waitForPane('90→21');
+        await waitForPane('Tokens');
         await waitForPane('Pi native');
         await tmux('send-keys', 'C-b');
         await waitForPane('Esc chat', false);
@@ -322,6 +346,7 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
         await waitForPane('/compact');
         await tmux('send-keys', 'Enter');
         await waitForPane('compacted summary text');
+        await waitForContextChange(continuedContext);
         await tmux('send-keys', 'C-d');
         await tmux('send-keys', 'C-d').catch(() => {});
         const deadline = Date.now() + 8000;
@@ -338,6 +363,7 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
             assert.ok(replayed.some(event => event.type === 'usage' && event.usage.output === 7));
             assert.ok(replayed.some(event => event.type === 'session.ready' && event.contextWindow === 8192));
             const live = [];
+            const contextUsage = [];
             const unsubscribe = session.subscribe(batch => live.push(...batch));
             try {
                 const child = session.rpc.child;
@@ -359,10 +385,13 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
                         .map(event => event.delta.text).join(''), reply);
                     assert.ok(live.some(event => event.type === 'usage' && event.usage.output === 7));
                     assert.ok(live.some(event => event.type === 'context.usage' && event.max === 8192));
+                    contextUsage.push(live.filter(event => event.type === 'context.usage').at(-1)?.used);
                     assert.equal(session.rpc.child, child);
                     assert.equal(child.exitCode, null);
                     assert.equal(child.signalCode, null);
                 }
+                assert.ok(contextUsage.every(used => Number.isFinite(used)), JSON.stringify(contextUsage));
+                assert.notEqual(contextUsage[1], contextUsage[0], 'continued turns must refresh measured context usage');
                 const commands = await session.capabilities.commands.list();
                 assert.ok(commands.some(command => command.name === 'pi-tree'));
                 assert.ok(commands.some(command => command.name === 'plan'));
@@ -461,6 +490,11 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
                 assert.ok(compaction.some(event => event.type === 'compaction.end' && event.contextReplaced === true));
                 assert.ok(compaction.some(event => event.type === 'user.message' && event.source === 'compaction'
                     && /compacted summary text/.test(event.text)), 'the summary renders as a compact row');
+                const postCompactUsage = compaction.find(event => event.type === 'context.usage');
+                assert.equal(postCompactUsage?.used, end?.postTokens,
+                    'compaction must publish Pi\'s post-compaction estimate immediately');
+                assert.ok(postCompactUsage.used < contextUsage.at(-1),
+                    `compaction must reduce measured context usage: ${JSON.stringify({ turns: contextUsage, after: postCompactUsage.used })}`);
                 let secondError;
                 try {
                     await session.capabilities.compact.run();

@@ -204,6 +204,10 @@ export class PiCliSession {
             this.emitLive([ev({ type: 'context.capacity', contextWindow: this.contextWindow })], { replay: false });
         }
     }
+    emitContextUsage(used, max = this.contextWindow) {
+        if (!Number.isFinite(used) || used < 0) return;
+        this.emitLive([ev({ type: 'context.usage', used, ...(max > 0 ? { max } : {}) })], { replay: false });
+    }
     async refreshStats() {
         try {
             const { sessionId, sessionFile, cost, contextUsage } = await this.rpc.request('get_session_stats', {}, 3000);
@@ -215,7 +219,7 @@ export class PiCliSession {
                 this.emitCapacity();
             }
             if (contextUsage?.tokens != null) {
-                this.emitLive([ev({ type: 'context.usage', used: contextUsage.tokens, max: contextUsage.contextWindow })], { replay: false });
+                this.emitContextUsage(contextUsage.tokens, contextUsage.contextWindow);
             }
         } catch (error) {
             this.host.debug?.(error.message);
@@ -743,6 +747,12 @@ export class PiCliSession {
                     ...(typeof record.errorMessage === 'string' && record.errorMessage !== '' ? { error: record.errorMessage } : {}),
                     time: Date.now(),
                 })], { replay: false });
+            if (ok && typeof result.estimatedTokensAfter === 'number') {
+                // Pi reports null from get_context_stats until another assistant
+                // settles after compaction. Publish its own post-compaction
+                // estimate now so the footer does not keep the replaced value.
+                this.emitContextUsage(result.estimatedTokensAfter);
+            }
             if (ok && typeof result.summary === 'string' && result.summary.trim() !== '') {
                 const summary = result.summary.trim();
                 this.emitLive([ev({
