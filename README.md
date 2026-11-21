@@ -1,4 +1,4 @@
-# dsh-pi
+# dsh-pi-backend
 
 在 dsh-tui 中浏览并续写 Pi 原生会话。Pi 负责运行模型、工具及会话存储，dsh-tui 负责输入和展示。
 
@@ -7,11 +7,11 @@
 需要可用的 dsh-tui 和 PATH 上的 Pi CLI。
 
 ```sh
-dsh plugin --profile dsh-tui -- add github:suemi994/dsh-pi
-dsh-tui --backend pi-cli
+dsh plugin --profile dsh-tui -- add github:suemi994/dsh-pi-backend
+dsh-tui --backend pi
 ```
 
-在 `/kernel` 选择 **Pi (CLI)**，或用 `dsh-tui --backend pi-cli` 启动。进入 Pi 内核后，`/resume` 主会话列表会按工作区显示 Pi 原生会话。用左栏切换项目，右栏选择会话。也可以用 `dsh-tui --backend pi-cli --resume <Pi会话ID>` 打开。等这一轮结束并退出 dsh-tui 后，在原项目目录用 `pi --session <Pi会话ID>` 或 `pi -r` 接手。两个前端使用同一个 Pi 会话 ID 和同一份 JSONL 文件。切换前端时应先退出当前前端，避免两个 Pi 进程同时写入一条会话。
+在 `/kernel` 选择 **Pi**，或用 `dsh-tui --backend pi` 启动。进入 Pi 内核后，`/resume` 主会话列表会按工作区显示 Pi 原生会话。用左栏切换项目，右栏选择会话。也可以用 `dsh-tui --backend pi --resume <Pi会话ID>` 打开。等这一轮结束并退出 dsh-tui 后，在原项目目录用 `pi --session <Pi会话ID>` 或 `pi -r` 接手。两个前端使用同一个 Pi 会话 ID 和同一份 JSONL 文件。切换前端时应先退出当前前端，避免两个 Pi 进程同时写入一条会话。
 
 会话目录默认取 `$PI_CODING_AGENT_DIR/sessions`，未设置时为 `~/.pi/agent/sessions`。如果 Pi 通过 `PI_CODING_AGENT_SESSION_DIR` 使用自定义目录，请为两端使用相同的环境变量。可选的 `PI_MODEL` 指定本插件调用 Pi 时的模型，省略时由 Pi 使用原会话或自己的默认配置。
 
@@ -40,7 +40,7 @@ npm test
 
 测试使用实际 Pi 二进制和临时目录，模型响应由环回 HTTP 服务提供。若设置 `PI_TUI_TEST_DSH_HOME` 为已安装本插件与 dsh-tui 的测试环境，则用 tmux 驱动真实 `/resume` 和回复界面，完成 Pi CLI → dsh-tui → Pi CLI 的交接。宿主禁止 loopback 监听时，真实回环会带原因跳过；运行 TUI 阶段仍需要 tmux 本地 socket。
 
-源自 [dok4everak47/dsh-backends 的 pi-cli 插件](https://github.com/dok4everak47/dsh-backends/tree/acae5b2d36493e3b6846962659328cca5f256f45/pi-cli)，上游包声明 ISC。宿主扩展接口见 [dsh-tui 插件手册 · 接缝稳定性参考](https://github.com/ccch1mneyyy/dsh-TUI/blob/main/docs/plugins.md#接缝稳定性参考)。
+源自 [dok4everak47/dsh-backends 的 Pi 后端](https://github.com/dok4everak47/dsh-backends/tree/acae5b2d36493e3b6846962659328cca5f256f45/pi-cli)，上游包声明 ISC。宿主扩展接口见 [dsh-tui 插件手册 · 接缝稳定性参考](https://github.com/ccch1mneyyy/dsh-TUI/blob/main/docs/plugins.md#接缝稳定性参考)。
 
 ## Pi Durable
 

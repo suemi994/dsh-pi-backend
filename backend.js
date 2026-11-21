@@ -2,16 +2,16 @@ import { spawnSync } from 'node:child_process';
 import { PiCliSession, piSessionPrefs } from './session.js';
 import { createPiCliCatalog, resolvePiSession } from './catalog.js';
 export const piCliManifest = {
-    id: 'pi-cli',
-    label: { kind: 'literal', text: 'Pi (CLI)' },
-    shortLabel: 'Pi CLI',
+    id: 'pi',
+    label: { kind: 'literal', text: 'Pi' },
+    shortLabel: 'Pi',
     inTree: false,
     backendExport: 'backend',
     capabilities: ['permissions', 'questions', 'models', 'effort', 'compact', 'sideQuery', 'commands', 'context', 'images', 'rename', 'fork', 'rewind'],
     grants: [],
 };
 export const piCliBackend = {
-    id: 'pi-cli',
+    id: 'pi',
     descriptor: { label: 'Pi (CLI)' },
     async detect(_host) {
         const result = spawnSync('pi', ['--version'], { timeout: 5000, encoding: 'utf8' });
@@ -30,7 +30,7 @@ export const piCliBackend = {
     },
     launch: {
         sessionPrefs: (host) => piSessionPrefs(host),
-        resumeCommand: (sessionId) => `dsh-tui --backend pi-cli --resume ${sessionId}`,
+        resumeCommand: (sessionId) => `dsh-tui --backend pi --resume ${sessionId}`,
     },
     catalog: createPiCliCatalog(),
 };

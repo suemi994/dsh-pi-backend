@@ -3,7 +3,18 @@ import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promise
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
+import { piCliBackend, piCliManifest } from '../backend.js';
 import { piBranch, writePiFork } from '../catalog.js';
+
+test('Pi registers its public backend identifier as pi', async () => {
+    const plugin = JSON.parse(await readFile(new URL('../dsh-plugin.json', import.meta.url), 'utf8'));
+    const contribution = plugin.contributes['x-dsh-tui'][0];
+    assert.equal(piCliManifest.id, 'pi');
+    assert.equal(piCliBackend.id, 'pi');
+    assert.equal(piCliManifest.shortLabel, 'Pi');
+    assert.equal(contribution.spec.id, 'pi');
+    assert.equal(contribution.spec.shortLabel, 'Pi');
+});
 
 test('Pi fork files preserve the selected branch as a new native session', async t => {
     const temp = await mkdtemp(join(tmpdir(), 'dsh-pi-fork-'));
@@ -20,6 +31,7 @@ test('Pi fork files preserve the selected branch as a new native session', async
 
     assert.deepEqual(piBranch(branch, 'assistant-1').map(entry => entry.id), ['user-1', 'assistant-1']);
     const ref = await writePiFork(path, 'source', temp, branch, 'Forked title');
+    assert.equal(ref.backendId, 'pi');
     const files = await readdir(temp);
     const forkFile = files.find(name => name !== 'source.jsonl' && name.endsWith('.jsonl'));
     assert.ok(forkFile);

@@ -74,7 +74,7 @@ async function describe(path, cwd) {
         return {
             path,
             summary: {
-                id: header.id, backendId: 'pi-cli', kind: { kind: 'root' },
+                id: header.id, backendId: 'pi', kind: { kind: 'root' },
                 title: { text: (title || promptText || basename(header.cwd) || header.cwd).slice(0, 160),
                     source: title ? 'renamed' : promptText ? 'prompt' : 'fallback' },
                 cwd: header.cwd, createdAt: Date.parse(header.timestamp) || stat.mtimeMs,
@@ -172,7 +172,7 @@ export async function writePiFork(path, sessionId, cwd, branch, title) {
         finally { await output.close(); }
         await rename(temporary, destination);
     } finally { await unlink(temporary).catch(() => {}); }
-    return { backendId: 'pi-cli', sessionId: id };
+    return { backendId: 'pi', sessionId: id };
 }
 
 export function createPiCliCatalog() {

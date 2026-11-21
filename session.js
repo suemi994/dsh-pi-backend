@@ -15,7 +15,7 @@ function ev(e) {
     return e;
 }
 export class PiCliSession {
-    backendId = 'pi-cli';
+    backendId = 'pi';
     sessionId;
     ref;
     capabilities = {
@@ -151,7 +151,7 @@ export class PiCliSession {
             onPendingChange: waiting => this.updateInteractionStatus(waiting),
             debug: message => this.host.debug?.(message),
         });
-        this.ref = { backendId: 'pi-cli', sessionId: sid };
+        this.ref = { backendId: 'pi', sessionId: sid };
         this.sessionFile = target.native?.path;
         this.title = target.native?.summary.title?.text;
         this.modelOverride = process.env.PI_MODEL || undefined;
@@ -831,7 +831,7 @@ export class PiCliSession {
     }
 }
 export function piSessionPrefs(host) {
-    const base = host.dataDir ?? join(host.cwd ?? process.cwd(), '.dsh-pi-cli');
+    const base = host.dataDir ?? join(host.cwd ?? process.cwd(), '.dsh-pi');
     const file = join(base, 'pi', 'sessions.json');
     const read = () => {
         try {
