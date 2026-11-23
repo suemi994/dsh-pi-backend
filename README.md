@@ -38,6 +38,8 @@ Pi 扩展的 `confirm` 弹窗会显示为权限批准，可选择允许一次或
 
 [dsh-tui 0.20.2 宿主补丁](patches/dsh-tui-0.20.2-pi-integration.patch) 通过 profile 的 pnpm `patchedDependencies` 应用到 `@deepseek-harness-tui/dsh-tui`。profile 已有同一个包的补丁时，把这些改动合入原补丁后重新安装。未应用补丁的宿主仍可用 `/pi-tree` 和 `/pi-fork` 访问 Pi 会话树及节点派生。
 
+启动或恢复 Pi 会话时，如果已安装的 dsh-tui 缺少自动建议的宿主支持，界面会显示警告。此时仍可用 `/suggest` 手动获取建议。
+
 ## 验证
 
 ```sh
