@@ -72,6 +72,10 @@ function mockProvider(requests, summaries, sideRequests, extra) {
                 id: 'chatcmpl-roundtrip', object: 'chat.completion.chunk', created: 1, model,
                 choices: [{ index: 0, ...choice }], usage,
             })}\n\n`);
+            if (process.env.PI_TUI_TEST_DSH_HOME && prompt === turns[1][0]) {
+                send({ delta: { role: 'assistant', reasoning_content: 'Pi reasoning fixture' }, finish_reason: null });
+                await new Promise(resolve => setTimeout(resolve, 1800));
+            }
             send({ delta: { role: 'assistant', content: reply }, finish_reason: null });
             send({ delta: {}, finish_reason: 'stop' }, { prompt_tokens: promptTokens, completion_tokens: 7,
                 total_tokens: promptTokens + 7, prompt_tokens_details: { cached_tokens: 12 } });
@@ -344,7 +348,9 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
             await waitForPane(`roundtrip-model · ${['high', 'low'][index]}`);
             await tmux('send-keys', '-l', prompt);
             await tmux('send-keys', 'Enter');
+            if (index === 0) await waitForPane(/· total \d+s · .*tokens/);
             await waitForPane(reply);
+            if (index === 0) await waitForPane(/· total \d+s · .*tokens/, false);
             if (index === 0) {
                 await waitForPane('Tab to accept · Show me the next step.');
                 const beforeTab = requests.length;

@@ -14,6 +14,7 @@ import { PiInteractions } from './interactions.js';
 import { piToolCall, piToolResult } from './presentation.js';
 import { createPiPromptInjector } from './prompt-injection.js';
 import { bridgeCommand } from './rpc-extension.js';
+import { createPiWorkingActivity } from './working-activity.js';
 function ev(e) {
     return e;
 }
@@ -176,8 +177,13 @@ export class PiCliSession {
     listeners = new Set();
     historyEvents = [];
     earlyEvents = [];
-    constructor(target, host) {
+    workingActivity;
+    constructor(target, host, ActivityTracker) {
         this.host = host;
+        if (ActivityTracker !== undefined) {
+            this.workingActivity = createPiWorkingActivity(ActivityTracker);
+            this.capabilities.workingActivity = { subscribe: this.workingActivity.subscribe };
+        }
         this.cwd = target.native?.summary.cwd ?? target.cwd ?? host.cwd ?? process.cwd();
         const sid = target.native?.summary.id ?? randomUUID();
         this.sessionId = sid;
@@ -457,7 +463,13 @@ export class PiCliSession {
             const update = e.assistantMessageEvent;
             const kind = update?.type === 'text_delta' ? 'text'
                 : update?.type === 'thinking_delta' ? 'reasoning' : undefined;
+            if (update?.type === 'thinking_end') this.workingActivity?.stop();
             if (kind && update.delta) {
+                if (kind === 'reasoning' && this.status === 'running') {
+                    this.workingActivity?.think(this.activeTurn.startedAt);
+                } else {
+                    this.workingActivity?.stop();
+                }
                 this.openIfNeeded();
                 this.streamed.add(kind);
                 this.emitDelta(kind, update.delta, update.contentIndex);
@@ -467,8 +479,12 @@ export class PiCliSession {
         case 'message_start':
             if (e.message?.role === 'user') this.onNativeUser(e.message);
             break;
-        case 'message_end': this.onMessageEnd(e.message); break;
+        case 'message_end':
+            if (e.message?.role === 'assistant') this.workingActivity?.stop();
+            this.onMessageEnd(e.message);
+            break;
         case 'tool_execution_start':
+            this.workingActivity?.stop();
             this.emitLive([this.toolCall(e.toolCallId, e.toolName, e.args)], { replay: false });
             break;
         case 'tool_execution_update': this.onToolUpdate(e); break;
@@ -625,6 +641,7 @@ export class PiCliSession {
     }
     setStatus(status) {
         this.status = status;
+        if (status !== 'running') this.workingActivity?.stop();
         this.emitLive([ev({ type: 'session.status', status })], { replay: false });
     }
     updateInteractionStatus(waiting) {
@@ -839,7 +856,7 @@ export class PiCliSession {
         let resolveTurn;
         const done = new Promise(resolve => { resolveTurn = resolve; });
         const anchor = `pi-user-${randomUUID()}`;
-        const turn = { done, resolve: resolveTurn, cancelled: false, userAnchors: [anchor], assistants: [] };
+        const turn = { done, resolve: resolveTurn, cancelled: false, userAnchors: [anchor], assistants: [], startedAt: Date.now() };
         this.activeTurn = turn;
         this.turnNo += 1;
         this.stepNo = 0;
@@ -849,7 +866,7 @@ export class PiCliSession {
         this.curAttemptId = '';
         this.emitPending({ claimed: [input.clientMessageId] });
         this.emitLive([
-            ev({ type: 'turn.start', turn: this.turnNo, origin: 'user', time: Date.now() }),
+            ev({ type: 'turn.start', turn: this.turnNo, origin: 'user', time: turn.startedAt }),
             ev({ type: 'user.message', id: input.clientMessageId, anchor, seq: ++this.seq,
                 turn: this.turnNo, time: Date.now(), source: 'user', text, blocks: [{ type: 'text', text: message }], images: input.images }),
         ], { replay: false });
@@ -958,6 +975,7 @@ export class PiCliSession {
     async settleTurn(turn, reason) {
         if (turn.settling) return;
         turn.settling = true;
+        this.workingActivity?.stop();
         await Promise.all([
             this.refreshStats(),
             this.captureAnchors(turn),
@@ -1009,6 +1027,7 @@ export class PiCliSession {
     }
     async dispose() {
         this.status = 'disposed';
+        this.workingActivity?.stop();
         this.sideQueries.abort();
         this.capabilities.infoStatus.close();
         this.interactions.cancelAll();

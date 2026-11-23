@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -35,13 +36,25 @@ async function hasPromptSuggestionSupport(root) {
     }
 }
 
+async function loadActivityTracker(root, host) {
+    try {
+        const require = createRequire(new URL('package.json', root));
+        const modulePath = require.resolve('dsh-working-activity/status');
+        const { ActivityTracker } = await import(pathToFileURL(modulePath).href);
+        return ActivityTracker;
+    } catch (error) {
+        host.debug?.(`Pi working activity unavailable: ${error.message}`);
+        return undefined;
+    }
+}
+
 export const piCliManifest = {
     id: 'pi',
     label: { kind: 'literal', text: 'Pi' },
     shortLabel: 'Pi',
     inTree: false,
     backendExport: 'backend',
-    capabilities: ['permissions', 'questions', 'models', 'effort', 'compact', 'sideQuery', 'commands', 'context', 'images', 'rename', 'fork', 'rewind'],
+    capabilities: ['permissions', 'questions', 'models', 'effort', 'compact', 'sideQuery', 'commands', 'context', 'images', 'rename', 'fork', 'rewind', 'workingActivity'],
     grants: [],
 };
 export const piCliBackend = {
@@ -58,9 +71,11 @@ export const piCliBackend = {
             native = await resolvePiSession(target.sessionId, target.cwd);
             if (!native) throw new Error(`Pi session not found: ${target.sessionId}`);
         }
-        const session = new PiCliSession({ ...target, native }, host);
+        const root = tuiPackageRoot();
+        const ActivityTracker = await loadActivityTracker(root, host);
+        const session = new PiCliSession({ ...target, native }, host, ActivityTracker);
         await session.start();
-        if (host.appVersion && !(await hasPromptSuggestionSupport(tuiPackageRoot()))) {
+        if (host.appVersion && !(await hasPromptSuggestionSupport(root))) {
             const version = host.appVersion;
             const warning = host.locale?.() === 'zh'
                 ? `dsh-tui ${version} 未检测到 Pi 自动建议的宿主支持。请应用与该版本匹配的宿主补丁，或用 /suggest 手动获取建议。`
