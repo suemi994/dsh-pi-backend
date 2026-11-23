@@ -9,10 +9,11 @@ export function createPiWorkingActivity(ActivityTracker) {
     }
 
     function stop() {
-        if (timer === undefined) return;
-        clearInterval(timer);
-        timer = undefined;
-        publish({ phase: 'idle', line: '' });
+        if (timer !== undefined) {
+            clearInterval(timer);
+            timer = undefined;
+        }
+        if (view.phase !== 'idle' || view.line !== '') publish({ phase: 'idle', line: '' });
     }
 
     return {
@@ -33,6 +34,14 @@ export function createPiWorkingActivity(ActivityTracker) {
             timer = setInterval(refresh, 500);
             timer.unref();
             refresh();
+        },
+        run(line) {
+            if (timer !== undefined) {
+                clearInterval(timer);
+                timer = undefined;
+            }
+            if (view.phase === 'waiting' && view.line === line) return;
+            publish({ phase: 'waiting', line });
         },
         stop,
     };

@@ -519,13 +519,15 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
                     answers: [{ selected: [], custom: 'edited fixture plan' }],
                 });
                 assert.equal((await planCommand).accepted, true);
-                const planResult = await waitForLive(event => event.type === 'notice'
+                const planResult = await waitForLive(event => event.type === 'user.message'
+                    && event.source === 'command-output' && event.label === '/plan'
                     && event.text.startsWith('PLAN_DIALOG_RESULT:'));
                 assert.equal(planResult.text, 'PLAN_DIALOG_RESULT:Review|Keep the extension flow|true|edited fixture plan');
 
                 live.length = 0;
                 assert.equal((await session.submit({ text: '/goal fixture objective', clientMessageId: 'goal-command' }, 'turn')).accepted, true);
-                const goalResult = await waitForLive(event => event.type === 'notice'
+                const goalResult = await waitForLive(event => event.type === 'user.message'
+                    && event.source === 'command-output' && event.label === '/goal'
                     && event.text.startsWith('GOAL_COMMAND:'));
                 assert.equal(goalResult.text, 'GOAL_COMMAND:fixture objective');
                 const beforeSide = await readFile(file, 'utf8');

@@ -37,6 +37,99 @@ test('Pi extension prefill and titles project into the host session', async t =>
         && event.title === 'Extension title' && event.source === 'auto'));
 });
 
+test('Pi command info notifications stay in the transcript as command output', async t => {
+    const { session, events } = fixtureSession();
+    t.after(() => session.dispose());
+    const report = 'sync setup: nutstore\nRemote backup: available\nRemote snapshot: latest';
+    session.rpc = {
+        async request(type) {
+            if (type === 'prompt') {
+                session.onRecord({ type: 'extension_ui_request', id: 'sync-status',
+                    method: 'notify', message: report, notifyType: 'info' });
+                return { disposition: 'handled' };
+            }
+            if (type === 'get_entries') return { entries: [], leafId: undefined };
+            return {};
+        },
+        async close() {},
+    };
+
+    await session.submit({ text: '/sync status', clientMessageId: 'sync-command' }, 'turn');
+    const output = events.find(event => event.type === 'user.message'
+        && event.source === 'command-output' && event.label === '/sync');
+    assert.equal(output?.text, report);
+    assert.equal(output?.displayLive, true);
+    assert.ok(!events.some(event => event.type === 'notice' && event.text === report));
+
+    events.length = 0;
+    session.rpc.request = async type => {
+        if (type === 'prompt') {
+            session.onRecord({ type: 'extension_ui_request', id: 'background-status',
+                method: 'notify', message: 'Background status', notifyType: 'info' });
+            return { disposition: 'handled' };
+        }
+        if (type === 'get_entries') return { entries: [], leafId: undefined };
+        return {};
+    };
+    await session.submit({ text: 'Plain prompt', clientMessageId: 'plain-prompt' }, 'turn');
+    assert.ok(events.some(event => event.type === 'notice'
+        && event.level === 'notice' && event.text === 'Background status'));
+});
+
+test('Pi prompt preflight waits for long-running extension commands', async t => {
+    const { session } = fixtureSession();
+    t.after(() => session.dispose());
+    let promptTimeout;
+    session.rpc = {
+        async request(type, _fields, timeout) {
+            if (type === 'prompt') {
+                promptTimeout = timeout;
+                return { disposition: 'handled' };
+            }
+            if (type === 'get_entries') return { entries: [], leafId: undefined };
+            return {};
+        },
+        async close() {},
+    };
+
+    await session.submit({ text: '/sync status', clientMessageId: 'sync-timeout' }, 'turn');
+    assert.equal(promptTimeout, null);
+    assert.notEqual(session.status, 'disposed');
+});
+
+test('Pi slash commands replace the generic preparing spinner with activity', async t => {
+    const { session } = fixtureSession();
+    t.after(() => session.dispose());
+    let resolvePrompt;
+    session.rpc = {
+        request(type) {
+            if (type === 'prompt') return new Promise(resolve => { resolvePrompt = resolve; });
+            if (type === 'get_entries') return Promise.resolve({ entries: [], leafId: undefined });
+            return Promise.resolve({});
+        },
+        async close() {},
+    };
+    const view = {};
+    session.workingActivity = {
+        run(line) {
+            Object.assign(view, { phase: 'waiting', line });
+        },
+        stop() {
+            Object.assign(view, { phase: 'idle', line: '' });
+        },
+        subscribe() {},
+    };
+
+    const pending = session.submit({ text: '/sync status', clientMessageId: 'sync-activity' }, 'turn');
+    assert.deepEqual(view, { phase: 'waiting', line: 'Running /sync…' });
+    session.onRecord({ type: 'extension_ui_request', id: 'sync-state',
+        method: 'setStatus', statusKey: 'sync', statusText: 'checking jianguoyun' });
+    assert.deepEqual(view, { phase: 'waiting', line: 'checking jianguoyun' });
+    resolvePrompt({ disposition: 'handled' });
+    await pending;
+    assert.deepEqual(view, { phase: 'idle', line: '' });
+});
+
 test('TUI-only Pi extension commands stay out of the host command menu', async t => {
     const { session } = fixtureSession();
     t.after(() => session.dispose());

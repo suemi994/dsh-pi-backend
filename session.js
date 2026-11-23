@@ -603,6 +603,14 @@ export class PiCliSession {
         this.emitLive([{ type: 'pending.changed',
             items: this.queued.map(({ id, text, placement }) => ({ id, text, placement })), ...change }], { replay: false });
     }
+    emitCommandOutput(label, text) {
+        const seq = ++this.seq;
+        this.emitLive([ev({
+            type: 'user.message', id: `pi-command-${seq}`, anchor: '', seq,
+            turn: this.turnNo, time: Date.now(), source: 'command-output', displayLive: true,
+            label, text, blocks: [{ type: 'text', text }],
+        })], { replay: false });
+    }
     onNativeUser(message) {
         const turn = this.activeTurn;
         if (!turn.receivedInitialUser) {
@@ -856,8 +864,13 @@ export class PiCliSession {
         let resolveTurn;
         const done = new Promise(resolve => { resolveTurn = resolve; });
         const anchor = `pi-user-${randomUUID()}`;
-        const turn = { done, resolve: resolveTurn, cancelled: false, userAnchors: [anchor], assistants: [], startedAt: Date.now() };
+        const turn = { done, resolve: resolveTurn, cancelled: false, userAnchors: [anchor], assistants: [],
+            commandLabel: commandName === undefined ? undefined : '/' + commandName, startedAt: Date.now() };
         this.activeTurn = turn;
+        if (turn.commandLabel !== undefined) {
+            const zh = this.host.locale?.() === 'zh';
+            this.workingActivity?.run(zh ? `正在执行 ${turn.commandLabel}…` : `Running ${turn.commandLabel}…`);
+        }
         this.turnNo += 1;
         this.stepNo = 0;
         this.toolSteps.clear();
@@ -872,7 +885,10 @@ export class PiCliSession {
         ], { replay: false });
         this.setStatus('running');
         try {
-            const response = await this.rpc.request('prompt', { message, images });
+            // `prompt` returns only after extension commands finish preflight.
+            // Sync status checks and extension dialogs are user- or network-paced,
+            // so the control-plane timeout would turn valid commands into errors.
+            const response = await this.rpc.request('prompt', { message, images }, null);
             if (this.activeTurn === turn && response?.disposition === 'handled') {
                 await this.settleTurn(turn, { kind: turn.cancelled ? 'aborted' : 'completed' });
             }
@@ -891,6 +907,10 @@ export class PiCliSession {
     }
     onRecord(record) {
         if (record.type === 'extension_ui_request') {
+            if (record.method === 'setStatus' && this.activeTurn?.commandLabel !== undefined
+                && typeof record.statusText === 'string' && record.statusText.trim() !== '') {
+                this.workingActivity?.run(record.statusText.trim());
+            }
             if (record.method === 'set_editor_text') {
                 if (typeof record.text === 'string' && record.text !== '') void this.promptInjector(record.text);
                 return;
@@ -905,7 +925,14 @@ export class PiCliSession {
             }
             if (record.method === 'notify' && typeof record.message === 'string') {
                 const level = ['warning', 'error'].includes(record.notifyType) ? record.notifyType : 'notice';
-                this.emitLive([{ type: 'notice', level, text: record.message }], { replay: false });
+                // Pi extensions report command results through notify(info). Keep
+                // those reports in the transcript; a transient toast would hide
+                // long output such as /sync status as soon as it expires.
+                if (level === 'notice' && this.activeTurn?.commandLabel !== undefined) {
+                    this.emitCommandOutput(this.activeTurn.commandLabel, record.message);
+                } else {
+                    this.emitLive([{ type: 'notice', level, text: record.message }], { replay: false });
+                }
             } else if (!this.interactions.handle(record)) this.capabilities.infoStatus.update(record);
             return;
         }
