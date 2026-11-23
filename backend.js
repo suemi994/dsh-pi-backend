@@ -50,8 +50,8 @@ async function loadActivityTracker(root, host) {
 
 export const piCliManifest = {
     id: 'pi',
-    label: { kind: 'literal', text: 'Pi' },
-    shortLabel: 'Pi',
+    label: { kind: 'literal', text: 'pi' },
+    shortLabel: 'pi',
     inTree: false,
     backendExport: 'backend',
     capabilities: ['permissions', 'questions', 'models', 'effort', 'compact', 'sideQuery', 'commands', 'context', 'images', 'rename', 'fork', 'rewind', 'workingActivity'],
@@ -59,7 +59,7 @@ export const piCliManifest = {
 };
 export const piCliBackend = {
     id: 'pi',
-    descriptor: { label: 'Pi (CLI)' },
+    descriptor: { label: piCliManifest.label.text },
     async detect(_host) {
         const result = spawnSync('pi', ['--version'], { timeout: 5000, encoding: 'utf8' });
         if (result.error || result.status !== 0) return { installed: false, hint: 'Install Pi and make pi available on PATH' };

@@ -4,14 +4,14 @@
 
 ## 安装与使用
 
-需要可用的 dsh-tui 和 PATH 上的 Pi CLI。
+需要可用的 dsh-tui，以及 PATH 上的 `pi` 可执行文件。
 
 ```sh
 dsh plugin --profile dsh-tui -- add github:suemi994/dsh-pi-backend
 dsh-tui --backend pi
 ```
 
-在 `/kernel` 选择 **Pi**，或用 `dsh-tui --backend pi` 启动。进入 Pi 内核后，`/resume` 主会话列表会按工作区显示 Pi 原生会话。用左栏切换项目，右栏选择会话。也可以用 `dsh-tui --backend pi --resume <Pi会话ID>` 打开。等这一轮结束并退出 dsh-tui 后，在原项目目录用 `pi --session <Pi会话ID>` 或 `pi -r` 接手。两个前端使用同一个 Pi 会话 ID 和同一份 JSONL 文件。切换前端时应先退出当前前端，避免两个 Pi 进程同时写入一条会话。
+在 `/kernel` 选择 **pi**，或用 `dsh-tui --backend pi` 启动。进入 Pi 内核后，`/resume` 主会话列表会按工作区显示 Pi 原生会话。用左栏切换项目，右栏选择会话。也可以用 `dsh-tui --backend pi --resume <Pi会话ID>` 打开。等这一轮结束并退出 dsh-tui 后，在原项目目录用 `pi --session <Pi会话ID>` 或 `pi -r` 接手。两个前端使用同一个 Pi 会话 ID 和同一份 JSONL 文件。切换前端时应先退出当前前端，避免两个 Pi 进程同时写入一条会话。
 
 会话目录默认取 `$PI_CODING_AGENT_DIR/sessions`，未设置时为 `~/.pi/agent/sessions`。如果 Pi 通过 `PI_CODING_AGENT_SESSION_DIR` 使用自定义目录，请为两端使用相同的环境变量。可选的 `PI_MODEL` 指定本插件调用 Pi 时的模型，省略时由 Pi 使用原会话或自己的默认配置。
 
@@ -40,6 +40,15 @@ Pi 扩展的 `confirm` 弹窗会显示为权限批准，可选择允许一次或
 
 启动或恢复 Pi 会话时，如果已安装的 dsh-tui 缺少自动建议的宿主支持，界面会显示警告。此时仍可用 `/suggest` 手动获取建议。
 
+### Codex 写锁提示
+
+在 Node.js 22.19 或 24+ 上，可从本项目根目录启动 dsh-tui 0.20.2，并预载运行时补丁。它在进程内过滤重复的写锁提示，恢复失败仍会显示原始错误。
+
+```sh
+NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--import=\"$PWD/patches/codex-stderr-preload.js\"" \
+  dsh-tui --backend codex --resume <会话ID>
+```
+
 ## 验证
 
 ```sh
@@ -52,4 +61,4 @@ npm test
 
 ## Pi Durable
 
-上游的进程内 Pi Durable 后端保留在 [pi-durable/](pi-durable/)。仓库根目录的安装命令安装 Pi CLI 后端。
+上游的进程内 Pi Durable 后端保留在 [pi-durable/](pi-durable/)。仓库根目录的安装命令安装通过会话级 RPC 与 Pi 通信的 `pi` 后端。

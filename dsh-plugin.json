@@ -16,8 +16,8 @@
       "name": "pi_backend",
       "spec": {
         "id": "pi",
-        "label": { "text": "Pi" },
-        "shortLabel": "Pi",
+        "label": { "text": "pi" },
+        "shortLabel": "pi",
         "product": "pi",
         "capabilities": ["permissions", "questions", "models", "effort", "compact", "sideQuery", "commands", "context", "images", "rename", "fork", "rewind", "workingActivity"],
         "grants": [],

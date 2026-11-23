@@ -313,7 +313,7 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
             `HOME=${isolatedHome}`,
             `DSH_HOME=${profile}`, 'DSH_TUI_LANG=en', ...Object.entries(env).filter(([, value]) => value !== undefined).map(([key, value]) => `${key}=${value}`),
             'dsh-tui', '--backend', 'pi');
-        await waitForPane('Pi · pi v');
+        await waitForPane('pi · pi v');
         await tmux('send-keys', '-l', '/resume');
         await waitForPane('/resume');
         await tmux('send-keys', 'Enter');

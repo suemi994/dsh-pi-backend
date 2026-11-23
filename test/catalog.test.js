@@ -6,14 +6,17 @@ import test from 'node:test';
 import { piCliBackend, piCliManifest } from '../backend.js';
 import { createPiCliCatalog, piBranch, writePiFork } from '../catalog.js';
 
-test('Pi registers its public backend identifier as pi', async () => {
+test('Pi registers its public backend identifier and display labels as pi', async () => {
     const plugin = JSON.parse(await readFile(new URL('../dsh-plugin.json', import.meta.url), 'utf8'));
     const contribution = plugin.contributes['x-dsh-tui'][0];
     assert.equal(piCliManifest.id, 'pi');
     assert.equal(piCliBackend.id, 'pi');
-    assert.equal(piCliManifest.shortLabel, 'Pi');
+    assert.equal(piCliManifest.label.text, 'pi');
+    assert.equal(piCliManifest.shortLabel, 'pi');
+    assert.equal(piCliBackend.descriptor.label, 'pi');
     assert.equal(contribution.spec.id, 'pi');
-    assert.equal(contribution.spec.shortLabel, 'Pi');
+    assert.equal(contribution.spec.label.text, 'pi');
+    assert.equal(contribution.spec.shortLabel, 'pi');
 });
 
 test('Pi fork files preserve the selected branch as a new native session', async t => {
