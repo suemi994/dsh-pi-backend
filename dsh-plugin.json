@@ -3,7 +3,7 @@
   "manifestVersion": "0.15",
   "id": "com.suemi.pi-backend",
   "name": "Pi Backend for dsh-tui",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "facets": { "host": { "entry": "register.js", "apiVersion": "v1alpha1" } },
   "requires": { "contracts": [] },
   "permissions": [],

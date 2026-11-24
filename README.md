@@ -30,6 +30,7 @@ Pi 扩展的 `confirm` 弹窗会显示为权限批准，可选择允许一次或
 - `/btw <问题>` 在侧栏或浮层回答旁路问题，`/recap` 生成摘要和可应用的标题。两者使用当前 Pi 模型和近期对话片段，在独立的无工具临时进程中运行，主会话和原生 JSONL 不受影响。只通过 Pi 扩展注册的模型可能无法在该进程中加载。
 - 应用宿主补丁后，Pi 完成回复时会用当前模型发起一次独立请求，生成一条后续消息建议。输入框为空时会自动显示，按 Tab 填入草稿，按 Enter 发送。`/suggest` 可手动获取多条建议。输入 `/` 也会显示 Pi 暴露的扩展命令、提示模板和技能。已安装的 Plan、Goal 等扩展注册的命令（如 `/plan`、`/goal`）会原样交给 Pi 扩展执行，本插件不复制其状态机。
 - Pi TUI 专属扩展命令（如 `sidebar`、`open-tui`、`tool-display`）在 RPC 模式下没有可用的界面，因此不会出现在 `/` 菜单；显式输入时会收到只能回到 Pi TUI 使用的提示。其他 TUI 插件的命令可用 `PI_HIDDEN_COMMANDS` 按名称追加隐藏，多个名称以逗号分隔。
+- 安装 `pi install npm:@suemi994/pi-init@next` 并应用宿主补丁后，Pi 注册的 `/init` 会从命令菜单或输入框交给 Pi 执行。可用 `/init --dry-run` 预览项目说明，或用 `/init --check-only` 检查 `AGENTS.md` 和 `CLAUDE.md`。
 - 应用宿主补丁后，Pi 内核下的 `/tree` 打开原生会话树。用 ↑↓ 选中消息，按 Enter 选择回退并编辑消息，或派生独立会话。派生后用界面显示的 `/resume <会话 ID>` 打开。`/tree <节点 ID>` 查看该节点的来路。`/fork` 派生当前分支，`/fork <节点 ID>` 从指定节点派生。旧的 `/pi-tree`、`/pi-fork`、`/pi-suggest` 仍可手动输入。
 - `/rewind` 使用 DSH 的对话回退流程。Pi 扩展提供 `/restore` 或 `/rewind` 时，命令菜单会额外显示 `/restore`，由 Pi 扩展决定可恢复的检查点和范围。
 - `/rename` 将标题写回 Pi 会话。`/context` 显示 Pi 最近一次有效的上下文测量，首次回复前及压缩后重新测量前可能没有数据。

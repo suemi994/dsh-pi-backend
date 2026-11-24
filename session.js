@@ -368,6 +368,18 @@ export class PiCliSession {
         });
         try {
             const state = await this.refreshRuntimeState(undefined, { emitCapacity: false });
+            // dsh-tui reads overrides when it binds the session. Only claim
+            // /init when Pi has registered it for this session.
+            try {
+                const init = (await this.extensionCommands()).find(command => command.name === 'init');
+                if (init) {
+                    this.capabilities.commands.localOverrides = [...localOverrides, {
+                        name: init.name, description: init.description,
+                    }];
+                }
+            } catch (error) {
+                this.host.debug?.(error.message);
+            }
             if (this.turnNo) {
                 try {
                     const { entries } = await this.rpc.request('get_entries', {}, 3000);

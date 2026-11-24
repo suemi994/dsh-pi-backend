@@ -224,6 +224,14 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
                     ctx.ui.notify('GOAL_COMMAND:' + args.trim(), 'info');
                 },
             });
+            pi.on('resources_discover', () => {
+                pi.registerCommand('init', {
+                    description: 'Fixture project initialization',
+                    handler: async (args, ctx) => {
+                        ctx.ui.notify('INIT_COMMAND:' + args.trim(), 'info');
+                    },
+                });
+            });
             pi.registerCommand('prefill', {
                 description: 'Fixture editor prefill command',
                 handler: async (args, ctx) => {
@@ -320,6 +328,11 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
         await waitForPane(turns[0][0]);
         await tmux('send-keys', 'Enter');
         await waitForPane(turns[0][1]);
+        await tmux('send-keys', '-l', '/init');
+        await waitForPane('Fixture project initialization');
+        await tmux('send-keys', '-l', ' --dry-run');
+        await tmux('send-keys', 'Enter');
+        await waitForPane('INIT_COMMAND:--dry-run');
         const initialContext = await contextReadout();
         await tmux('send-keys', '-l', '/panel info');
         await tmux('send-keys', 'Enter');
@@ -485,6 +498,8 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
                 assert.ok(commands.some(command => command.name === 'tree'));
                 assert.ok(commands.some(command => command.name === 'plan'));
                 assert.ok(commands.some(command => command.name === 'goal'));
+                assert.deepEqual(session.capabilities.commands.localOverrides.find(command => command.name === 'init'),
+                    { name: 'init', description: 'Fixture project initialization' });
                 const currentUser = live.find(event => event.type === 'user.message' && event.source === 'user');
                 const waitForLive = async predicate => {
                     const deadline = Date.now() + 5000;
@@ -495,6 +510,13 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
                     }
                     assert.fail(`Timed out waiting for live event: ${JSON.stringify(live.slice(-8))}`);
                 };
+                live.length = 0;
+                const initResult = await session.submit({ text: '/init --dry-run', clientMessageId: 'init-preview' }, 'turn');
+                assert.equal(initResult.accepted, true);
+                const initPreview = await waitForLive(event => event.type === 'user.message'
+                    && event.source === 'command-output' && event.label === '/init');
+                assert.equal(initPreview.text, 'INIT_COMMAND:--dry-run');
+
                 live.length = 0;
                 const planCommand = session.submit({ text: '/plan dialog', clientMessageId: 'plan-dialog' }, 'turn');
                 const planChoice = await waitForLive(event => event.type === 'question.request');
