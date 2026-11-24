@@ -150,6 +150,8 @@ export class PiCliSession {
     activeTurn;
     rpc;
     contextWindow;
+    contextRevision = 0;
+    contextRefreshQueued = false;
     providerId = '';
     modelId = '';
     status = 'starting';
@@ -263,11 +265,14 @@ export class PiCliSession {
         this.emitLive([ev({ type: 'context.usage', used, ...(max > 0 ? { max } : {}) })], { replay: false });
     }
     async refreshStats() {
+        const contextRevision = this.contextRevision;
         try {
             const { sessionId, sessionFile, cost, contextUsage } = await this.rpc.request('get_session_stats', {}, 3000);
             if (this.status === 'disposed' || sessionId !== this.sessionId) return;
             this.sessionFile = sessionFile || this.sessionFile;
             this.sessionCost = Number.isFinite(cost) ? { amount: cost, currency: 'USD', source: 'backend' } : undefined;
+            // A compaction event may already have published a newer estimate.
+            if (contextRevision !== this.contextRevision) return;
             if (contextUsage?.contextWindow > 0 && contextUsage.contextWindow !== this.contextWindow) {
                 this.contextWindow = contextUsage.contextWindow;
                 this.emitCapacity();
@@ -278,6 +283,15 @@ export class PiCliSession {
         } catch (error) {
             this.host.debug?.(error.message);
         }
+    }
+    queueContextRefresh() {
+        if (this.contextRefreshQueued) return;
+        this.contextRefreshQueued = true;
+        // Coalesce messages delivered together, including parallel tool results.
+        queueMicrotask(() => {
+            this.contextRefreshQueued = false;
+            if (this.activeTurn && !this.activeTurn.settling) void this.refreshStats();
+        });
     }
     async refreshRuntimeState(state, { emitCapacity = true } = {}) {
         state ??= await this.rpc.request('get_state');
@@ -494,6 +508,9 @@ export class PiCliSession {
         case 'message_end':
             if (e.message?.role === 'assistant') this.workingActivity?.stop();
             this.onMessageEnd(e.message);
+            // Pi persists these messages as the event completes. Read its
+            // context while the next model request or tool is still running.
+            if (['user', 'assistant', 'toolResult'].includes(e.message?.role)) this.queueContextRefresh();
             break;
         case 'tool_execution_start':
             this.workingActivity?.stop();
@@ -961,6 +978,7 @@ export class PiCliSession {
         if (record.type === 'compaction_end') {
             const result = record.result;
             const ok = result !== undefined && record.aborted !== true;
+            if (ok) this.contextRevision++;
             this.emitLive([ev({
                     type: 'compaction.end',
                     ok,

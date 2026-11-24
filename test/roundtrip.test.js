@@ -648,10 +648,16 @@ test('real Pi CLI and the backend append to the same native session', { timeout:
         const fresh = await backend.open({ kind: 'new', cwd }, host);
         const live = [];
         fresh.subscribe(batch => live.push(...batch));
+        live.length = 0;
         try {
             assert.equal((await fresh.submit({ text: 'Fixture image prompt', clientMessageId: 'image',
                 blocks: [{ type: 'text', text: 'Fixture image prompt' }, { type: 'image' }], images: [image] }, 'turn')).accepted, true);
             await imageTurn;
+            const contextDeadline = Date.now() + 5000;
+            while (!live.some(event => event.type === 'context.usage' && event.used > 0 && event.max === 8192)) {
+                assert.ok(Date.now() < contextDeadline, 'Pi must publish context usage while the first model response is pending');
+                await new Promise(resolve => setTimeout(resolve, 20));
+            }
             const done = fresh.activeTurn.done;
             assert.equal((await fresh.submit({ text: '/steer Fixture steer', clientMessageId: 'steer', images: [image] }, 'steer')).accepted, true);
             assert.equal((await fresh.submit({ text: 'Fixture follow-up', clientMessageId: 'follow' }, 'followup')).accepted, true);
